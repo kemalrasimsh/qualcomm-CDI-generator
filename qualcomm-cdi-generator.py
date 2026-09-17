@@ -34,6 +34,40 @@ CDI_VERSION = "0.6.0"
 # CDI vendor namespace prefixed to every generated 'kind' (e.g. qualcomm.com/gpu)
 CDI_VENDOR = "qualcomm.com"
 
+# Ownership and permissions applied to every generated deviceNodes entry. The
+# container runtime uses these to create the node inside the container, so they
+# describe the access the container should get rather than the host node's
+# current state.
+#
+# Nodes are exposed as root-owned and group accessible; the group differs per
+# device class, matching the hand-maintained specs these defaults were taken
+# from: the V4L2 nodes belong to the 'video' group (44) while the render, DMA
+# heap and Hexagon DSP nodes are handed to the container user's primary group
+# (1000).
+DEFAULT_FILE_MODE = 0o660
+DEFAULT_UID = 0
+DEFAULT_GID = 1000
+CLASS_GID = {
+    'gpu':          1000,
+    'v4l2':         44,
+    'dmaheap':      1000,
+    'fastrpc-cdsp': 1000,
+    'fastrpc-adsp': 1000,
+}
+
+def node_permissions(cdiclass: str, filemode: int | None = None,
+                     uid: int | None = None, gid: int | None = None) -> dict:
+    """Return the fileMode/uid/gid attributes for one device class.
+
+    Explicit arguments (from the command line) win over the built-in per-class
+    defaults, so a caller can force a single mode/owner across every class.
+    """
+    return {
+        "fileMode": DEFAULT_FILE_MODE if filemode is None else filemode,
+        "uid": DEFAULT_UID if uid is None else uid,
+        "gid": CLASS_GID.get(cdiclass, DEFAULT_GID) if gid is None else gid,
+    }
+
 def setup_logging(verbosity: int) -> None:
     level = logging.WARNING
     if verbosity == 1:
@@ -42,12 +76,34 @@ def setup_logging(verbosity: int) -> None:
         level = logging.DEBUG
     logging.basicConfig(format="%(levelname)s: %(message)s", level=level)
 
+def parse_octal_mode(value: str) -> int:
+    """Parse a file mode from the command line, defaulting to octal.
+
+    Modes are conventionally written in octal ('660', '0660'), so bare digits
+    are read base 8; an explicit prefix ('0o660', '0x1b0') is honoured too.
+    Anything else is rejected rather than quietly reinterpreted -- '668' looks
+    like a mode but is not octal, and accepting it as decimal would hand back a
+    silently different permission set.
+    """
+    if re.fullmatch(r'0?[0-7]+', value):
+        return int(value, 8)
+    if re.fullmatch(r'0[oxb][0-9a-fA-F]+', value):
+        try:
+            return int(value, 0)
+        except ValueError:
+            pass
+    raise argparse.ArgumentTypeError(
+        "invalid file mode: %r (expected octal, e.g. 660)" % value)
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate Qualcomm CDI and hook script")
     parser.add_argument("-d", "--destdir", default="/", help="Destination root directory (default: %(default)s)")
     parser.add_argument("-H", "--hookfilename", default="vendorhook", help="Hook script filename (default: %(default)s)")
     parser.add_argument("-c", "--cdifilename", default="qualcomm.json", help="CDI JSON filename base; the device class is inserted before the extension, e.g. qualcomm.json -> qualcomm-gpu.json (default: %(default)s)")
     parser.add_argument("-C", "--classes", default=None, help="Comma-separated list of CDI classes to generate (default: all). Available: %s" % ", ".join(known_classes))
+    parser.add_argument("-m", "--filemode", type=parse_octal_mode, default=None, metavar="MODE", help="fileMode for generated device nodes, parsed as octal (default: %#o)" % DEFAULT_FILE_MODE)
+    parser.add_argument("-u", "--uid", type=int, default=None, help="uid for generated device nodes (default: %d)" % DEFAULT_UID)
+    parser.add_argument("-g", "--gid", type=int, default=None, metavar="GID", help="gid for generated device nodes, overriding the per-class defaults (%s)" % ", ".join("%s=%d" % (c, CLASS_GID[c]) for c in known_classes))
     parser.add_argument("-n", "--dry-run", action="store_true", help="Parse and probe devices but do not write any files")
     parser.add_argument("-v", "--verbose", action="count", default=0, help="Increase verbosity (-v, -vv)")
     return parser.parse_args()
@@ -59,25 +115,37 @@ def find_devicenodes(deviceglob: str) -> list[str]:
     logging.debug("Nodes for %s: %s", deviceglob, files)
     return files
 
-def generate_devicenodes_cdi(nickname: str, filesglob: list[str]) -> list[dict]:
+def generate_devicenodes_cdi(nickname: str, filesglob: list[str],
+                             permissions: dict | None = None) -> list[dict]:
     if filesglob:
         logging.info("Generating CDI entries for '%s' with %d node(s)", nickname, len(filesglob) if filesglob else 0)
         filesglob_set = set(filesglob)
+
+        # Ownership/permission attributes attached to every emitted node; an
+        # empty dict keeps the bare {"path": ...} form used before these were
+        # added, which the CDI schema still accepts.
+        nodeattrs = permissions or {}
 
         # -secure nodes whose non-secure parent is also present are handled as siblings of
         # that parent entry, not as independent top-level entries
         def is_sibling(node: str) -> bool:
             return node.endswith('-secure') and node[:-len('-secure')] in filesglob_set
 
+        def node_entry(node: str) -> dict:
+            # One deviceNodes entry: the path plus the shared fileMode/uid/gid.
+            # dict(nodeattrs) copies per entry so callers cannot alias a single
+            # attribute dict across every generated node.
+            return dict({"path": node}, **nodeattrs)
+
         def node_paths(node: str) -> list[dict]:
             # deviceNodes entries for one node: the node itself, plus its -secure
             # sibling when this is a cdsp/adsp node and that sibling is present.
-            paths = [{"path": node}]
+            paths = [node_entry(node)]
             if node.endswith(('cdsp', 'adsp')):
                 securepath = node + "-secure"
                 if securepath in filesglob_set:
                     logging.debug("DSP node detected, adding -secure variant for %s", node)
-                    paths.append({"path": securepath})
+                    paths.append(node_entry(securepath))
             return paths
 
         # Count only nodes that will produce their own CDI entry
@@ -161,6 +229,10 @@ def main() -> int:
     setup_logging(args.verbose)
     logging.info("Starting Qualcomm CDI generation")
     logging.info("Config: destdir=%s, hookfilename=%s, cdifilename=%s, dry_run=%s", args.destdir, args.hookfilename, args.cdifilename, args.dry_run)
+    logging.info("Node attributes: fileMode=%s, uid=%s, gid=%s",
+                 "%#o" % args.filemode if args.filemode is not None else "%#o (default)" % DEFAULT_FILE_MODE,
+                 args.uid if args.uid is not None else "%d (default)" % DEFAULT_UID,
+                 args.gid if args.gid is not None else "per-class default")
 
     if args.classes is not None:
         requested = [c.strip() for c in args.classes.split(',')]
@@ -178,25 +250,30 @@ def main() -> int:
     hookfilename = args.hookfilename
     cdifilename = args.cdifilename
 
+    # Ownership/permissions applied to the generated device nodes, per class so
+    # each one keeps its conventional group unless overridden on the CLI.
+    def perms(cdiclass: str) -> dict:
+        return node_permissions(cdiclass, args.filemode, args.uid, args.gid)
+
     # Find rendernodes and create entries for them
     rendernodes = find_devicenodes('/dev/dri/renderD*')
-    render_cdi = generate_devicenodes_cdi('renderD', rendernodes)
+    render_cdi = generate_devicenodes_cdi('renderD', rendernodes, perms('gpu'))
 
     # Find all videonoodes and generate entries
     # TODO: add input/output filters to make selecting between encoders, decoders and cameras easier
     videonodes = find_devicenodes('/dev/video*')
-    video_cdi = generate_devicenodes_cdi('video', videonodes)
+    video_cdi = generate_devicenodes_cdi('video', videonodes, perms('v4l2'))
 
     # Check for DMA heap
     dmaheaps = find_devicenodes('/dev/dma_heap/*system')
-    dmaheap_cdi = generate_devicenodes_cdi('dmaheap-system', dmaheaps)
+    dmaheap_cdi = generate_devicenodes_cdi('dmaheap-system', dmaheaps, perms('dmaheap'))
 
     # Check for DSP nodes
     cdsps = find_devicenodes('/dev/fastrpc-cdsp*')
-    cdsps_cdi = generate_devicenodes_cdi('fastrpc-cdsp', cdsps)
+    cdsps_cdi = generate_devicenodes_cdi('fastrpc-cdsp', cdsps, perms('fastrpc-cdsp'))
 
     adsps = find_devicenodes('/dev/fastrpc-adsp*')
-    adsps_cdi = generate_devicenodes_cdi('fastrpc-adsp', adsps)
+    adsps_cdi = generate_devicenodes_cdi('fastrpc-adsp', adsps, perms('fastrpc-adsp'))
 
     # Host-side helpers
     # TODO: generate helper scripts based the results of the above probes

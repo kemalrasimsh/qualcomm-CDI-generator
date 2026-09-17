@@ -169,6 +169,109 @@ class StructuralTests(unittest.TestCase):
         self.assertIn("/dev/fastrpc-cdsp", paths)
         self.assertIn("/dev/fastrpc-cdsp-secure", paths)
 
+    def test_class_default_permissions(self):
+        # The v4l2 nodes belong to the 'video' group while the render nodes go
+        # to the container user's group; both are root-owned and 0660.
+        self.assertEqual(gen.node_permissions("v4l2"),
+                         {"fileMode": 0o660, "uid": 0, "gid": 44})
+        self.assertEqual(gen.node_permissions("gpu"),
+                         {"fileMode": 0o660, "uid": 0, "gid": 1000})
+
+    def test_permission_overrides(self):
+        # Explicit CLI values win over the per-class defaults.
+        self.assertEqual(gen.node_permissions("v4l2", 0o666, 1000, 1001),
+                         {"fileMode": 0o666, "uid": 1000, "gid": 1001})
+        # A partial override leaves the untouched fields at their defaults.
+        self.assertEqual(gen.node_permissions("v4l2", None, None, 100),
+                         {"fileMode": 0o660, "uid": 0, "gid": 100})
+
+    def test_unknown_class_falls_back_to_default_gid(self):
+        self.assertEqual(gen.node_permissions("brandnew")["gid"], gen.DEFAULT_GID)
+
+    def test_permissions_applied_to_every_node(self):
+        # Both the per-node entries and the ':all' catch-all carry the attributes.
+        perms = gen.node_permissions("v4l2")
+        devices = gen.generate_devicenodes_cdi("video", ["/dev/video0", "/dev/video1"], perms)
+        emitted = [n for d in devices for n in d["containerEdits"]["deviceNodes"]]
+        self.assertTrue(emitted)
+        for node in emitted:
+            self.assertEqual(node["fileMode"], 0o660)
+            self.assertEqual(node["uid"], 0)
+            self.assertEqual(node["gid"], 44)
+
+    def test_permissions_applied_to_secure_sibling(self):
+        # The folded-in -secure node must not be left without attributes.
+        perms = gen.node_permissions("fastrpc-cdsp")
+        devices = gen.generate_devicenodes_cdi(
+            "fastrpc-cdsp", ["/dev/fastrpc-cdsp", "/dev/fastrpc-cdsp-secure"], perms)
+        named = {d["name"]: d for d in devices}
+        secure = [n for n in named["fastrpc-cdsp"]["containerEdits"]["deviceNodes"]
+                  if n["path"].endswith("-secure")]
+        self.assertEqual(len(secure), 1)
+        self.assertEqual(secure[0], dict({"path": "/dev/fastrpc-cdsp-secure"}, **perms))
+
+    def test_permissions_are_not_aliased(self):
+        # Each emitted node needs its own dict; a shared one would let a later
+        # mutation leak across every device in the spec.
+        perms = gen.node_permissions("v4l2")
+        devices = gen.generate_devicenodes_cdi("video", ["/dev/video0", "/dev/video1"], perms)
+        emitted = [n for d in devices for n in d["containerEdits"]["deviceNodes"]]
+        self.assertEqual(len({id(n) for n in emitted}), len(emitted))
+        # Mutating the source dict must not retroactively change the output.
+        perms["gid"] = 999
+        self.assertTrue(all(n["gid"] == 44 for n in emitted))
+
+    def test_permissions_omitted_when_not_requested(self):
+        # Called without permissions the helper keeps the bare path-only form.
+        devices = gen.generate_devicenodes_cdi("video", ["/dev/video0"])
+        node = devices[0]["containerEdits"]["deviceNodes"][0]
+        self.assertEqual(node, {"path": "/dev/video0"})
+
+    def test_filemode_parsed_as_octal(self):
+        # Modes are conventionally octal, with or without a leading zero.
+        self.assertEqual(gen.parse_octal_mode("660"), 0o660)
+        self.assertEqual(gen.parse_octal_mode("0660"), 0o660)
+        self.assertEqual(gen.parse_octal_mode("0o660"), 0o660)
+        # An explicit non-octal prefix is still honoured.
+        self.assertEqual(gen.parse_octal_mode("0x1b0"), 0o660)
+        # '8' is not an octal digit, and neither is a bare word.
+        for bad in ("668", "rw-rw----", ""):
+            with self.assertRaises(gen.argparse.ArgumentTypeError):
+                gen.parse_octal_mode(bad)
+
+    def _written_nodes(self, destdir, filename):
+        spec = json.loads((Path(destdir) / "run" / "cdi" / filename).read_text())
+        return [n for d in spec["devices"] for n in d["containerEdits"]["deviceNodes"]]
+
+    def test_generated_files_carry_permissions(self):
+        # End to end: a default run must emit the attributes with the per-class
+        # gid, and the JSON must round-trip fileMode as a decimal integer (the
+        # JSON grammar has no octal literal).
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(run_generator(["-d", d]), 0)
+            for filename, gid in (("qualcomm-v4l2.json", 44),
+                                  ("qualcomm-gpu.json", 1000),
+                                  ("qualcomm-dmaheap.json", 1000),
+                                  ("qualcomm-fastrpc-cdsp.json", 1000),
+                                  ("qualcomm-fastrpc-adsp.json", 1000)):
+                nodes = self._written_nodes(d, filename)
+                self.assertTrue(nodes, "%s has no device nodes" % filename)
+                for node in nodes:
+                    self.assertEqual(node["fileMode"], 0o660, filename)
+                    self.assertEqual(node["uid"], 0, filename)
+                    self.assertEqual(node["gid"], gid, filename)
+
+    def test_cli_overrides_reach_generated_files(self):
+        with tempfile.TemporaryDirectory() as d:
+            rc = run_generator(["-d", d, "-m", "666", "-u", "1000", "-g", "1001"])
+            self.assertEqual(rc, 0)
+            # -g overrides the per-class gid for every class, v4l2 included.
+            for filename in ("qualcomm-v4l2.json", "qualcomm-gpu.json"):
+                for node in self._written_nodes(d, filename):
+                    self.assertEqual(node["fileMode"], 0o666, filename)
+                    self.assertEqual(node["uid"], 1000, filename)
+                    self.assertEqual(node["gid"], 1001, filename)
+
     def test_legacy_monolithic_cdi_removed(self):
         # An old single-file qualcomm.json left in /run/cdi must be removed so it
         # cannot define stale/conflicting devices alongside the per-class files.
@@ -263,7 +366,8 @@ class ValidationTests(unittest.TestCase):
 
     def test_gpu_spec_validates(self):
         nodes = ["/dev/dri/renderD128", "/dev/dri/renderD129"]
-        devices = gen.generate_devicenodes_cdi("renderD", nodes)
+        devices = gen.generate_devicenodes_cdi("renderD", nodes,
+                                               gen.node_permissions("gpu"))
         spec = gen.build_cdi_spec("gpu", devices, "vendorhook", [], [])
         with tempfile.TemporaryDirectory() as d:
             self._write_spec(d, "gpu", spec)
@@ -271,14 +375,16 @@ class ValidationTests(unittest.TestCase):
 
     def test_v4l2_spec_validates(self):
         nodes = ["/dev/video%d" % i for i in range(5)]
-        devices = gen.generate_devicenodes_cdi("video", nodes)
+        devices = gen.generate_devicenodes_cdi("video", nodes,
+                                               gen.node_permissions("v4l2"))
         spec = gen.build_cdi_spec("v4l2", devices, "vendorhook", [], [])
         with tempfile.TemporaryDirectory() as d:
             self._write_spec(d, "v4l2", spec)
             self._assert_valid(d)
 
     def test_dmaheap_spec_validates(self):
-        devices = gen.generate_devicenodes_cdi("dmaheap-system", ["/dev/dma_heap/system"])
+        devices = gen.generate_devicenodes_cdi("dmaheap-system", ["/dev/dma_heap/system"],
+                                               gen.node_permissions("dmaheap"))
         spec = gen.build_cdi_spec("dmaheap", devices, "vendorhook", [], [])
         with tempfile.TemporaryDirectory() as d:
             self._write_spec(d, "dmaheap", spec)
@@ -286,7 +392,8 @@ class ValidationTests(unittest.TestCase):
 
     def test_fastrpc_spec_with_mounts_and_env_validates(self):
         nodes = ["/dev/fastrpc-cdsp", "/dev/fastrpc-cdsp-secure"]
-        devices = gen.generate_devicenodes_cdi("fastrpc-cdsp", nodes)
+        devices = gen.generate_devicenodes_cdi("fastrpc-cdsp", nodes,
+                                               gen.node_permissions("fastrpc-cdsp"))
         mounts = [{"hostPath": "/usr/share/foo/bar/1.0/aarch64/dsp/",
                    "containerPath": "/usr/share/foo/bar/1.0/aarch64/dsp/",
                    "options": ["nosuid", "ro", "bind"]}]

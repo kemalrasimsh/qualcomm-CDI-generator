@@ -62,8 +62,40 @@ The tool probes the hardware, writes one CDI JSON file per device class under `/
 | `-H` | `--hookfilename` | `vendorhook` | Hook script filename written under `<destdir>/bin/` |
 | `-c` | `--cdifilename` | `qualcomm.json` | CDI filename base; the device class is inserted before the extension, e.g. `qualcomm.json` → `qualcomm-gpu.json` |
 | `-C` | `--classes` | all | Comma-separated list of CDI classes to generate. Available: `gpu`, `v4l2`, `dmaheap`, `fastrpc-cdsp`, `fastrpc-adsp` |
+| `-m` | `--filemode` | `0660` | `fileMode` for generated device nodes, parsed as octal |
+| `-u` | `--uid` | `0` | `uid` for generated device nodes |
+| `-g` | `--gid` | per class | `gid` for generated device nodes, overriding the per-class defaults |
 | `-n` | `--dry-run` | off | Probe devices but do not write any files |
 | `-v` | `--verbose` | off | Increase verbosity; use `-vv` for debug output |
+
+### Device node ownership and permissions
+
+Every generated `deviceNodes` entry carries `fileMode`, `uid` and `gid`, which
+the container runtime applies when it creates the node inside the container.
+These describe the access the container should get, not the host node's current
+state, so the generated spec is self-contained and does not depend on the host
+permissions at generation time.
+
+The defaults expose nodes root-owned and group accessible (`0660`, `uid` 0). The
+group is per device class:
+
+| Class | Default `gid` | Rationale |
+|-------|---------------|-----------|
+| `gpu` | 1000 | render node handed to the container user's primary group |
+| `v4l2` | 44 | V4L2 nodes conventionally belong to the `video` group |
+| `dmaheap` | 1000 | DMA heap handed to the container user's primary group |
+| `fastrpc-cdsp` | 1000 | Hexagon DSP node handed to the container user's primary group |
+| `fastrpc-adsp` | 1000 | Hexagon DSP node handed to the container user's primary group |
+
+Override any of them for all classes at once:
+
+```shell
+# qualcomm-cdi-generator.py --filemode 660 --uid 0 --gid 1000
+```
+
+`--filemode` is read as octal, so `660` and `0660` both mean `rw-rw----`. Note
+that JSON has no octal literal, so the emitted value is the decimal equivalent:
+`0660` appears in the file as `432`.
 
 ### Example session
 
@@ -71,6 +103,7 @@ The tool probes the hardware, writes one CDI JSON file per device class under `/
 (cdi) root@ventunoq:~# qualcomm-cdi-generator.py -v
 INFO: Starting Qualcomm CDI generation
 INFO: Config: destdir=/, hookfilename=vendorhook, cdifilename=qualcomm.json, dry_run=False
+INFO: Node attributes: fileMode=0o660 (default), uid=0 (default), gid=per-class default
 INFO: Found 1 nodes for pattern /dev/dri/renderD*
 INFO: Generating CDI entries for 'renderD' with 1 node(s)
 INFO: Found 30 nodes for pattern /dev/video*
@@ -205,6 +238,7 @@ To generate only the fastrpc classes:
 (cdi) root@ventunoq:~# qualcomm-cdi-generator.py --classes fastrpc-cdsp,fastrpc-adsp -v
 INFO: Starting Qualcomm CDI generation
 INFO: Config: destdir=/, hookfilename=vendorhook, cdifilename=qualcomm.json, dry_run=False
+INFO: Node attributes: fileMode=0o660 (default), uid=0 (default), gid=per-class default
 INFO: Found 1 nodes for pattern /dev/dri/renderD*
 INFO: Generating CDI entries for 'renderD' with 1 node(s)
 INFO: Found 30 nodes for pattern /dev/video*
@@ -226,7 +260,7 @@ INFO: Completed Qualcomm CDI generation
 
 ### CDI file structure
 
-The tool writes one JSON file per device class. Each file has a `kind` matching its class (e.g. `qualcomm.com/gpu`). The `fastrpc` files additionally include bind-mounts for Hexagon DSP firmware found under `/usr/share/*/*/*/*/dsp/` and the devicetree model string, since those binaries are tightly coupled to the in-kernel firmware loader.
+The tool writes one JSON file per device class. Each file has a `kind` matching its class (e.g. `qualcomm.com/gpu`). Every `deviceNodes` entry carries `fileMode`, `uid` and `gid` (see [Device node ownership and permissions](#device-node-ownership-and-permissions)). The `fastrpc` files additionally include bind-mounts for Hexagon DSP firmware found under `/usr/share/*/*/*/*/dsp/` and the devicetree model string, since those binaries are tightly coupled to the in-kernel firmware loader.
 
 Example `qualcomm-gpu.json`:
 ```json
@@ -237,13 +271,17 @@ Example `qualcomm-gpu.json`:
     {
       "name": "renderD128",
       "containerEdits": {
-        "deviceNodes": [ { "path": "/dev/dri/renderD128" } ]
+        "deviceNodes": [
+          { "path": "/dev/dri/renderD128", "fileMode": 432, "uid": 0, "gid": 1000 }
+        ]
       }
     },
     {
       "name": "renderD:all",
       "containerEdits": {
-        "deviceNodes": [ { "path": "/dev/dri/renderD128" } ]
+        "deviceNodes": [
+          { "path": "/dev/dri/renderD128", "fileMode": 432, "uid": 0, "gid": 1000 }
+        ]
       }
     }
   ],
@@ -253,6 +291,8 @@ Example `qualcomm-gpu.json`:
   }
 }
 ```
+
+`fileMode` is `432`, the decimal form of octal `0660`.
 
 ## Validating generated CDI files
 
