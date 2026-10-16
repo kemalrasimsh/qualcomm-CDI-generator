@@ -16,7 +16,35 @@ files](#validating-generated-cdi-files)).
 
 The main tool only requires python3 to generate a CDI. To consume it, you need a container runtime like podman or docker.
 
-Recent versions of Podman (5.6.x) and Docker (28.3.x) work out of the box, for earlier Docker versions (26.x–27.x) you'll need a `/etc/docker/daemon.json` file:
+### Minimum runtime versions
+
+The generated specs declare `cdiVersion` `0.7.0`, because that is the first CDI
+version defining `additionalGids` (see [Device node ownership and
+permissions](#device-node-ownership-and-permissions)). A runtime built against
+an older CDI library rejects the spec with:
+
+```
+the spec version must be at least v0.7.0
+```
+
+So a runtime that bundles CDI `specs-go` v0.7.0 or later is required:
+
+| Runtime | Minimum version | Reason |
+|---------|-----------------|--------|
+| Docker  | **26.1.0** | first release vendoring CDI `specs-go` v0.7.0; 26.0.x vendors v0.6.0 and rejects these specs |
+| Podman  | **5.1.0** | first release vendoring CDI `specs-go` v0.7.0; 5.0.x and 4.x vendor v0.6.0 |
+
+Docker 29.x vendors CDI `specs-go` v1.1.0 and needs no configuration: CDI is
+enabled by default and `/etc/cdi` and `/var/run/cdi` are scanned out of the box,
+so the generated files are picked up as soon as they are written.
+
+```shell
+$ docker --version
+Docker version v29.3.0, build df016a3a9
+```
+
+Podman 5.6.x and Docker 28.3.x likewise work out of the box. For Docker
+26.1.x–27.x you need a `/etc/docker/daemon.json` file:
 
 ```json
 {
@@ -38,7 +66,10 @@ For Docker 28.0.x only the feature enablement is needed:
 
 Either restart the docker daemon or reboot to have this config take effect.
 
-> **Note:** Docker 26.x shows the configured `CDI spec directories` in `docker info` but does not list `Discovered Devices`. Devices are still available for use with `--device`; the "Discovered Devices" section only appears in Docker 28.x and later.
+> **Note:** On Docker 29.x the `cdi` feature flag is opt-*out* — it only needs to
+> appear in `daemon.json` to switch CDI off (`"cdi": false`).
+
+> **Note:** Docker 26.1.x shows the configured `CDI spec directories` in `docker info` but does not list `Discovered Devices`. Devices are still available for use with `--device`; the "Discovered Devices" section only appears in Docker 28.x and later.
 
 ## Installation Instructions
 
@@ -52,19 +83,18 @@ On the target, run the CDI generator as root. The output directory `/run/cdi` is
 # qualcomm-cdi-generator.py
 ```
 
-The tool probes the hardware, writes one CDI JSON file per device class under `/run/cdi`, and writes a hook script to `/bin/vendorhook`. Run with `-v` to see what was found and written, or `-vv` for full debug output.
+The tool probes the hardware and writes one CDI JSON file per device class under `/run/cdi`. It writes nothing outside that directory and makes no changes to the host device nodes, so it works on targets whose platform filesystem is mounted read-only. Run with `-v` to see what was found and written, or `-vv` for full debug output.
 
 ### Command-line options
 
 | Option | Long form | Default | Description |
 |--------|-----------|---------|-------------|
 | `-d` | `--destdir` | `/` | Root directory for all output paths |
-| `-H` | `--hookfilename` | `vendorhook` | Hook script filename written under `<destdir>/bin/` |
 | `-c` | `--cdifilename` | `qualcomm.json` | CDI filename base; the device class is inserted before the extension, e.g. `qualcomm.json` → `qualcomm-gpu.json` |
 | `-C` | `--classes` | all | Comma-separated list of CDI classes to generate. Available: `gpu`, `v4l2`, `dmaheap`, `fastrpc-cdsp`, `fastrpc-adsp` |
 | `-m` | `--filemode` | `0660` | `fileMode` for generated device nodes, parsed as octal |
 | `-u` | `--uid` | `0` | `uid` for generated device nodes |
-| `-g` | `--gid` | per class | `gid` for generated device nodes, overriding the per-class defaults |
+| `-g` | `--gid` | from host nodes | `gid` for generated device nodes and `additionalGids`, overriding the group read from each host device node |
 | `-n` | `--dry-run` | off | Probe devices but do not write any files |
 | `-v` | `--verbose` | off | Increase verbosity; use `-vv` for debug output |
 
@@ -76,22 +106,67 @@ These describe the access the container should get, not the host node's current
 state, so the generated spec is self-contained and does not depend on the host
 permissions at generation time.
 
-The defaults expose nodes root-owned and group accessible (`0660`, `uid` 0). The
-group is per device class:
+Because the nodes are exposed group accessible rather than world accessible, the
+container process has to be a member of the owning group to open them. Each
+generated spec therefore also sets `containerEdits.additionalGids` to those
+groups, so the runtime adds them to the container's supplementary groups.
 
-| Class | Default `gid` | Rationale |
-|-------|---------------|-----------|
+Access is expressed entirely within the CDI spec. The generator does not install
+a `createContainer` hook and never changes the permissions of the host device
+nodes.
+
+The group is read from the host device node, because that is the group the
+driver and its udev rules actually hand the device to, and it varies per board —
+a render node is `render` on one target and the container user's primary group
+on another. Reading it keeps the spec matched to the hardware it was generated
+on instead of a compiled-in guess. The generator only reads the node's group; it
+does not change it.
+
+The group is resolved **per node**, not per class, because one class can span
+several groups on a single board — a target may expose `/dev/video32` in `video`
+while a camera node alongside it belongs to a vendor group:
+
+```
+INFO: Groups for 'v4l2' nodes: 44 (30 node(s)), 1002 (2 node(s))
+```
+
+Each `deviceNodes` entry then carries the group that owns that node, and the
+spec grants every one of them:
+
+```json
+  "containerEdits": {
+    "additionalGids": [ 44, 1002 ]
+  }
+```
+
+`additionalGids` is a spec-level array while `gid` is per node, so granting only
+one group would leave exactly the nodes that differ unopenable inside the
+container.
+
+A node falls back to a built-in per-class default when it has no group of its
+own — it could not be read, or it is owned by group `root` (a `root:root` node
+has no group to join, and the runtime drops a `0` entry from `additionalGids`,
+so honouring it would grant an unprivileged container nothing):
+
+| Class | Fallback `gid` | Rationale |
+|-------|----------------|-----------|
 | `gpu` | 1000 | render node handed to the container user's primary group |
 | `v4l2` | 44 | V4L2 nodes conventionally belong to the `video` group |
 | `dmaheap` | 1000 | DMA heap handed to the container user's primary group |
 | `fastrpc-cdsp` | 1000 | Hexagon DSP node handed to the container user's primary group |
 | `fastrpc-adsp` | 1000 | Hexagon DSP node handed to the container user's primary group |
 
-Override any of them for all classes at once:
+Nodes are exposed root-owned and group accessible (`0660`, `uid` 0). Override
+any of that for all classes at once:
 
 ```shell
 # qualcomm-cdi-generator.py --filemode 660 --uid 0 --gid 1000
 ```
+
+`--gid` replaces the group read from the host nodes for every node and class, so
+the spec grants exactly that one group. It sets both the node `gid` and
+`additionalGids`, keeping the groups the container joins in sync with the groups
+that own the nodes.
 
 `--filemode` is read as octal, so `660` and `0660` both mean `rw-rw----`. Note
 that JSON has no octal literal, so the emitted value is the decimal equivalent:
@@ -102,22 +177,25 @@ that JSON has no octal literal, so the emitted value is the decimal equivalent:
 ```shell
 (cdi) root@ventunoq:~# qualcomm-cdi-generator.py -v
 INFO: Starting Qualcomm CDI generation
-INFO: Config: destdir=/, hookfilename=vendorhook, cdifilename=qualcomm.json, dry_run=False
-INFO: Node attributes: fileMode=0o660 (default), uid=0 (default), gid=per-class default
+INFO: Config: destdir=/, cdifilename=qualcomm.json, dry_run=False
+INFO: Node attributes: fileMode=0o660 (default), uid=0 (default), gid=from host device nodes
 INFO: Found 1 nodes for pattern /dev/dri/renderD*
+INFO: Group for 'gpu' nodes: 1000
 INFO: Generating CDI entries for 'renderD' with 1 node(s)
 INFO: Found 30 nodes for pattern /dev/video*
+INFO: Group for 'v4l2' nodes: 44
 INFO: Generating CDI entries for 'video' with 30 node(s)
 INFO: Found 1 nodes for pattern /dev/dma_heap/*system
+INFO: Group for 'dmaheap' nodes: 1000
 INFO: Generating CDI entries for 'dmaheap-system' with 1 node(s)
 INFO: Found 2 nodes for pattern /dev/fastrpc-cdsp*
+INFO: Group for 'fastrpc-cdsp' nodes: 1000
 INFO: Generating CDI entries for 'fastrpc-cdsp' with 2 node(s)
 INFO: Found 1 nodes for pattern /dev/fastrpc-adsp*
+INFO: Group for 'fastrpc-adsp' nodes: 1000
 INFO: Generating CDI entries for 'fastrpc-adsp' with 1 node(s)
-INFO: Total nodes aggregated for hook: 35
 INFO: Detected Arduino Monza from devicetree
 INFO: Found 14 nodes for pattern /usr/share/*/*/*/*/dsp/
-INFO: Wrote hook script: /bin/vendorhook
 WARNING: Old style monolithic CDI detected, removing /run/cdi/qualcomm.json
 INFO: Wrote CDI JSON: /run/cdi/qualcomm-gpu.json
 INFO: Wrote CDI JSON: /run/cdi/qualcomm-v4l2.json
@@ -237,22 +315,25 @@ To generate only the fastrpc classes:
 ```shell
 (cdi) root@ventunoq:~# qualcomm-cdi-generator.py --classes fastrpc-cdsp,fastrpc-adsp -v
 INFO: Starting Qualcomm CDI generation
-INFO: Config: destdir=/, hookfilename=vendorhook, cdifilename=qualcomm.json, dry_run=False
-INFO: Node attributes: fileMode=0o660 (default), uid=0 (default), gid=per-class default
+INFO: Config: destdir=/, cdifilename=qualcomm.json, dry_run=False
+INFO: Node attributes: fileMode=0o660 (default), uid=0 (default), gid=from host device nodes
 INFO: Found 1 nodes for pattern /dev/dri/renderD*
+INFO: Group for 'gpu' nodes: 1000
 INFO: Generating CDI entries for 'renderD' with 1 node(s)
 INFO: Found 30 nodes for pattern /dev/video*
+INFO: Group for 'v4l2' nodes: 44
 INFO: Generating CDI entries for 'video' with 30 node(s)
 INFO: Found 1 nodes for pattern /dev/dma_heap/*system
+INFO: Group for 'dmaheap' nodes: 1000
 INFO: Generating CDI entries for 'dmaheap-system' with 1 node(s)
 INFO: Found 2 nodes for pattern /dev/fastrpc-cdsp*
+INFO: Group for 'fastrpc-cdsp' nodes: 1000
 INFO: Generating CDI entries for 'fastrpc-cdsp' with 2 node(s)
 INFO: Found 1 nodes for pattern /dev/fastrpc-adsp*
+INFO: Group for 'fastrpc-adsp' nodes: 1000
 INFO: Generating CDI entries for 'fastrpc-adsp' with 1 node(s)
-INFO: Total nodes aggregated for hook: 35
 INFO: Detected Arduino Monza from devicetree
 INFO: Found 14 nodes for pattern /usr/share/*/*/*/*/dsp/
-INFO: Wrote hook script: /bin/vendorhook
 INFO: Wrote CDI JSON: /run/cdi/qualcomm-fastrpc-cdsp.json
 INFO: Wrote CDI JSON: /run/cdi/qualcomm-fastrpc-adsp.json
 INFO: Completed Qualcomm CDI generation
@@ -260,12 +341,16 @@ INFO: Completed Qualcomm CDI generation
 
 ### CDI file structure
 
-The tool writes one JSON file per device class. Each file has a `kind` matching its class (e.g. `qualcomm.com/gpu`). Every `deviceNodes` entry carries `fileMode`, `uid` and `gid` (see [Device node ownership and permissions](#device-node-ownership-and-permissions)). The `fastrpc` files additionally include bind-mounts for Hexagon DSP firmware found under `/usr/share/*/*/*/*/dsp/` and the devicetree model string, since those binaries are tightly coupled to the in-kernel firmware loader.
+The tool writes one JSON file per device class. Each file has a `kind` matching its class (e.g. `qualcomm.com/gpu`). Every `deviceNodes` entry carries `fileMode`, `uid` and the `gid` read from that host device node, and the spec-level `containerEdits` sets `additionalGids` to every group those nodes use (see [Device node ownership and permissions](#device-node-ownership-and-permissions)). The `fastrpc` files additionally include bind-mounts for Hexagon DSP firmware found under `/usr/share/*/*/*/*/dsp/` and the devicetree model string, since those binaries are tightly coupled to the in-kernel firmware loader.
+
+The specs declare `cdiVersion` `0.7.0`, the first CDI version that defines
+`additionalGids`; see [Minimum runtime versions](#minimum-runtime-versions) for
+the runtime releases that accept it.
 
 Example `qualcomm-gpu.json`:
 ```json
 {
-  "cdiVersion": "0.6.0",
+  "cdiVersion": "0.7.0",
   "kind": "qualcomm.com/gpu",
   "devices": [
     {
@@ -286,8 +371,8 @@ Example `qualcomm-gpu.json`:
     }
   ],
   "containerEdits": {
-    "hooks": [ { "hookName": "createContainer", "path": "/bin/vendorhook" } ],
-    "env": [ "MACHINE_NAME=Qualcomm Technologies, Inc. Robotics RB3gen2" ]
+    "env": [ "MACHINE_NAME=Qualcomm Technologies, Inc. Robotics RB3gen2" ],
+    "additionalGids": [ 1000 ]
   }
 }
 ```
