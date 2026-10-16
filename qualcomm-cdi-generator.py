@@ -17,9 +17,9 @@ from __future__ import annotations
 
 import glob
 import json
+import os
 from pathlib import Path
 import re
-import stat
 import sys
 import logging
 import argparse
@@ -29,10 +29,111 @@ known_classes = ['gpu', 'v4l2', 'dmaheap', 'fastrpc-cdsp', 'fastrpc-adsp']
 # CDI specification version emitted in every generated spec file. See the CNCF
 # Container Device Interface project for the format definition:
 # https://github.com/cncf-tags/container-device-interface
-CDI_VERSION = "0.6.0"
+#
+# 0.7.0 is the minimum version that defines containerEdits.additionalGids, which
+# the generated specs rely on to grant access to the group-owned device nodes.
+# Emitting it under an older version makes the spec fail validation.
+CDI_VERSION = "0.7.0"
 
 # CDI vendor namespace prefixed to every generated 'kind' (e.g. qualcomm.com/gpu)
 CDI_VENDOR = "qualcomm.com"
+
+# Groups the container is put into so it can reach the device nodes a class
+# passes through. The spec carries them as containerEdits.additionalGids and
+# nothing on the host filesystem is touched.
+#
+# The group is taken from the host device node itself (see node_gid_map()),
+# because that is the group the driver and its udev rules actually hand the
+# device to, and it differs per board: a render node may be 'render' on one
+# target and the container user's primary group on another. It can also differ
+# *within* a class on one board, so the group is resolved per node and the
+# union granted.
+#
+# CLASS_GID is only the fallback for when a node has no group of its own (it
+# could not be stat()ed, or it is owned by group root), and keeps the values of
+# the hand-maintained specs these defaults were taken from: the V4L2 nodes
+# belong to the 'video' group (44) while the render, DMA heap and Hexagon DSP
+# nodes are handed to the container user's primary group (1000).
+DEFAULT_GID = 1000
+CLASS_GID = {
+    'gpu':          1000,
+    'v4l2':         44,
+    'dmaheap':      1000,
+    'fastrpc-cdsp': 1000,
+    'fastrpc-adsp': 1000,
+}
+
+def node_gid_map(cdiclass: str, nodes: list[str] | None = None,
+                 gid: int | None = None) -> dict[str, int]:
+    """Map each device node of one class to the group to grant for it.
+
+    An explicit --gid always wins, for every node. Otherwise each node's group
+    is read from the node itself, so the spec names the group that actually owns
+    the device on this board rather than a compiled-in guess.
+
+    The group is resolved per node because one class can span several groups on
+    a single board: a target may expose /dev/video32 in 'video' while a camera
+    node alongside it belongs to a vendor group. Collapsing those to one gid
+    would emit the wrong owner for every node outside the winning group, so each
+    node keeps its own and build_cdi_spec() grants the union (see
+    node_additional_gids).
+
+    The per-class CLASS_GID default stands in for any node with no group of its
+    own: one that disappeared between the glob and the stat, or one owned by
+    group root. A root-owned node is not honoured because the runtime drops a 0
+    additionalGids entry, so a 0 here would grant an unprivileged container
+    nothing.
+    """
+    fallback = CLASS_GID.get(cdiclass, DEFAULT_GID)
+    gidmap = {}
+    for node in sorted(nodes or []):
+        if gid is not None:
+            gidmap[node] = gid
+            continue
+        try:
+            nodegid = os.stat(node).st_gid
+        except OSError as err:
+            logging.debug("Cannot stat %s for its group, using gid %d: %s",
+                          node, fallback, err)
+            nodegid = fallback
+        if not nodegid:
+            logging.debug("%s is owned by group root, using gid %d instead",
+                          node, fallback)
+            nodegid = fallback
+        gidmap[node] = nodegid
+    bygid = {}
+    for node, nodegid in gidmap.items():
+        bygid.setdefault(nodegid, []).append(node)
+    if len(bygid) > 1:
+        logging.info("Groups for '%s' nodes: %s", cdiclass,
+                     ", ".join("%d (%d node(s))" % (g, len(group))
+                               for g, group in sorted(bygid.items())))
+    elif bygid:
+        logging.info("Group for '%s' nodes: %d", cdiclass, next(iter(bygid)))
+    return gidmap
+
+def node_additional_gids(cdiclass: str,
+                         gids: int | list[int] | None = None) -> list[int]:
+    """Return the additionalGids to grant for one device class.
+
+    A device node the runtime bind-mounts rather than re-creates keeps the
+    host's group on it, so the container process must be in that group to open
+    it. Adding those gids to the container's supplementary groups keeps the
+    nodes reachable without relaxing a mode on either side.
+
+    Every group found on the class's nodes is granted, not just one:
+    additionalGids is a spec-level array, so a class whose nodes span several
+    groups needs all of them. Granting only the most common one would leave the
+    rest unopenable for exactly the nodes that differ.
+
+    gid 0 is dropped: the runtime skips a 0 entry when it builds the OCI spec,
+    so emitting it would only add a no-op to every generated file.
+    """
+    if gids is None:
+        gids = [CLASS_GID.get(cdiclass, DEFAULT_GID)]
+    elif isinstance(gids, int):
+        gids = [gids]
+    return sorted({nodegid for nodegid in gids if nodegid})
 
 def setup_logging(verbosity: int) -> None:
     level = logging.WARNING
@@ -43,11 +144,11 @@ def setup_logging(verbosity: int) -> None:
     logging.basicConfig(format="%(levelname)s: %(message)s", level=level)
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Generate Qualcomm CDI and hook script")
+    parser = argparse.ArgumentParser(description="Generate Qualcomm CDI specification files")
     parser.add_argument("-d", "--destdir", default="/", help="Destination root directory (default: %(default)s)")
-    parser.add_argument("-H", "--hookfilename", default="vendorhook", help="Hook script filename (default: %(default)s)")
     parser.add_argument("-c", "--cdifilename", default="qualcomm.json", help="CDI JSON filename base; the device class is inserted before the extension, e.g. qualcomm.json -> qualcomm-gpu.json (default: %(default)s)")
     parser.add_argument("-C", "--classes", default=None, help="Comma-separated list of CDI classes to generate (default: all). Available: %s" % ", ".join(known_classes))
+    parser.add_argument("-g", "--gid", type=int, default=None, metavar="GID", help="gid to grant via additionalGids, overriding the group read from the host device nodes")
     parser.add_argument("-n", "--dry-run", action="store_true", help="Parse and probe devices but do not write any files")
     parser.add_argument("-v", "--verbose", action="count", default=0, help="Increase verbosity (-v, -vv)")
     return parser.parse_args()
@@ -127,27 +228,33 @@ def get_devicenode_index(nodename: str) -> int | None:
     nodeindex = re.search(r'\d+$', nodename)
     return int(nodeindex.group()) if nodeindex else None
 
-def build_cdi_spec(cdiclass: str, devices: list[dict], hookfilename: str,
-                   enventries: list[str], mountentries: list[dict | None]) -> dict:
+def build_cdi_spec(cdiclass: str, devices: list[dict],
+                   enventries: list[str], mountentries: list[dict | None],
+                   additionalgids: list[int] | None = None) -> dict:
     """Assemble a single CDI specification dict for one device class.
 
     The returned structure follows the CDI spec format defined by the CNCF
     Container Device Interface project:
         https://github.com/cncf-tags/container-device-interface
 
-    cdiclass:     device class name, suffixed onto CDI_VENDOR for the 'kind'
-    devices:      list of CDI device entries (as built by generate_devicenodes_cdi)
-    hookfilename: basename of the createContainer hook script under /bin
-    enventries:   list of "KEY=value" strings added to containerEdits.env
-    mountentries: list of mount dicts; only attached for fastrpc classes
+    cdiclass:       device class name, suffixed onto CDI_VENDOR for the 'kind'
+    devices:        list of CDI device entries (as built by generate_devicenodes_cdi)
+    enventries:     list of "KEY=value" strings added to containerEdits.env
+    mountentries:   list of mount dicts; only attached for fastrpc classes
+    additionalgids: supplementary groups the container needs to open the nodes
+
+    Access is expressed entirely through additionalGids: the container joins
+    every group owning one of the class's device nodes, and nothing is changed
+    on the host filesystem.
 
     This function is pure (no filesystem access) so the generated spec can be
     validated by the upstream 'cdi' tool in the unit tests.
     """
     cdi = {"cdiVersion": CDI_VERSION, "kind": CDI_VENDOR + "/" + cdiclass}
     cdi["devices"] = devices
-    container_edits = {"hooks": [{"hookName": "createContainer", "path": "/bin/" + hookfilename}],
-                       "env": enventries}
+    container_edits = {"env": enventries}
+    if additionalgids:
+        container_edits["additionalGids"] = additionalgids
     # Only bind-mount DSP firmware and devicetree for fastrpc device classes,
     # as those are the only classes that use Hexagon binaries
     if "fastrpc" in cdiclass:
@@ -160,7 +267,9 @@ def main() -> int:
     args = parse_args()
     setup_logging(args.verbose)
     logging.info("Starting Qualcomm CDI generation")
-    logging.info("Config: destdir=%s, hookfilename=%s, cdifilename=%s, dry_run=%s", args.destdir, args.hookfilename, args.cdifilename, args.dry_run)
+    logging.info("Config: destdir=%s, cdifilename=%s, dry_run=%s", args.destdir, args.cdifilename, args.dry_run)
+    logging.info("Groups to grant: %s",
+                 args.gid if args.gid is not None else "from the host device nodes")
 
     if args.classes is not None:
         requested = [c.strip() for c in args.classes.split(',')]
@@ -175,42 +284,44 @@ def main() -> int:
 
     # Use CLI-configured values
     destdir = args.destdir
-    hookfilename = args.hookfilename
     cdifilename = args.cdifilename
+
+    # Groups to grant the container, resolved per node from the host nodes just
+    # probed, so every node is reachable under the group the device is actually
+    # handed to on this board unless it is overridden on the CLI. classgids
+    # collects the groups each class ended up using, which become that spec's
+    # additionalGids.
+    classgids = {}
+
+    def resolve_gids(cdiclass: str, nodes: list[str]) -> None:
+        """Resolve the group of every node of a class and record the union."""
+        gidmap = node_gid_map(cdiclass, nodes, args.gid)
+        classgids[cdiclass] = sorted(set(gidmap.values()))
 
     # Find rendernodes and create entries for them
     rendernodes = find_devicenodes('/dev/dri/renderD*')
+    resolve_gids('gpu', rendernodes)
     render_cdi = generate_devicenodes_cdi('renderD', rendernodes)
 
     # Find all videonoodes and generate entries
     # TODO: add input/output filters to make selecting between encoders, decoders and cameras easier
     videonodes = find_devicenodes('/dev/video*')
+    resolve_gids('v4l2', videonodes)
     video_cdi = generate_devicenodes_cdi('video', videonodes)
 
     # Check for DMA heap
     dmaheaps = find_devicenodes('/dev/dma_heap/*system')
+    resolve_gids('dmaheap', dmaheaps)
     dmaheap_cdi = generate_devicenodes_cdi('dmaheap-system', dmaheaps)
 
     # Check for DSP nodes
     cdsps = find_devicenodes('/dev/fastrpc-cdsp*')
+    resolve_gids('fastrpc-cdsp', cdsps)
     cdsps_cdi = generate_devicenodes_cdi('fastrpc-cdsp', cdsps)
 
     adsps = find_devicenodes('/dev/fastrpc-adsp*')
+    resolve_gids('fastrpc-adsp', adsps)
     adsps_cdi = generate_devicenodes_cdi('fastrpc-adsp', adsps)
-
-    # Host-side helpers
-    # TODO: generate helper scripts based the results of the above probes
-    # Only chmod nodes for classes that are actually being generated, so
-    # --classes keeps the hook script in sync with the written CDI files.
-    nodes_by_class = {
-        'gpu':          rendernodes,
-        'v4l2':         videonodes,
-        'dmaheap':      dmaheaps,
-        'fastrpc-cdsp': cdsps,
-        'fastrpc-adsp': adsps,
-    }
-    allnodes = [n for c, nodes in nodes_by_class.items() if c in enabled_classes for n in nodes]
-    logging.info("Total nodes aggregated for hook: %d", len(allnodes))
 
     # Bind mounts into container
     # The primary use case is passing tightly coupled files into the
@@ -248,22 +359,6 @@ def main() -> int:
     if dtmodelstring is not None:
         enventries = [ "MACHINE_NAME=" + dtmodelstring ]
 
-    # Generate hookscript that runs during createContainer
-    hookscriptbindir = Path(destdir).joinpath('bin')
-    hookscriptpath = Path(hookscriptbindir).joinpath(hookfilename)
-    if args.dry_run:
-        logging.info("Dry run: skipping hook script write to %s", hookscriptpath)
-    else:
-        Path(hookscriptbindir).mkdir(parents=True, exist_ok=True)
-        with open( hookscriptpath, "w") as hookscript:
-            hookscript.write("#!/bin/bash\n\n")
-            hookscript.write("# This script has been autogenerated by %s\n" % __file__)
-            hookscript.write("# Changes made to this file directly *will* be lost\n\n")
-            hookscript.write("for node in " + " ".join(allnodes) + " ; do \n\tchmod 0666 ${node}\ndone\n")
-        hookscript.close()
-        hookscriptpath.chmod(hookscriptpath.stat().st_mode | stat.S_IEXEC)
-        logging.info("Wrote hook script: %s", hookscriptpath)
-
     # Write one CDI json per device class
     cdi_sections = [
         ('gpu',          render_cdi),
@@ -293,7 +388,8 @@ def main() -> int:
         if not devices:
             logging.debug("Skipping CDI file for '%s': no devices", cdiclass)
             continue
-        cdi = build_cdi_spec(cdiclass, devices, hookfilename, enventries, mountentries)
+        cdi = build_cdi_spec(cdiclass, devices, enventries, mountentries,
+                             node_additional_gids(cdiclass, classgids.get(cdiclass)))
         section_filename = "%s-%s%s" % (cdifilename_stem, cdiclass, cdifilename_suffix)
         cdipath = dynamiccdidir.joinpath(section_filename)
         if args.dry_run:
