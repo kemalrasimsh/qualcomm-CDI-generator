@@ -19,7 +19,8 @@ The main tool only requires python3 to generate a CDI. To consume it, you need a
 ### Minimum runtime versions
 
 The generated specs declare `cdiVersion` `0.7.0`, because that is the first CDI
-version defining `additionalGids` (see [Group access](#group-access)). A runtime built against
+version defining `additionalGids` (see [Group
+access](#group-access)). A runtime built against
 an older CDI library rejects the spec with:
 
 ```
@@ -90,44 +91,579 @@ The tool probes the hardware and writes one CDI JSON file per device class under
 |--------|-----------|---------|-------------|
 | `-d` | `--destdir` | `/` | Root directory for all output paths |
 | `-c` | `--cdifilename` | `qualcomm.json` | CDI filename base; the device class is inserted before the extension, e.g. `qualcomm.json` → `qualcomm-gpu.json` |
-| `-C` | `--classes` | all | Comma-separated list of CDI classes to generate. Available: `gpu`, `v4l2`, `dmaheap`, `fastrpc-cdsp`, `fastrpc-adsp` |
-| `-g` | `--gid` | from host nodes | `gid` to grant via `additionalGids`, overriding the group read from each host device node |
+| `-C` | `--classes` | all | Comma-separated list of CDI classes to generate. Available: `gpu`, `v4l2`, `camera`, `audio`, `display`, `dmaheap`, `fastrpc-cdsp`, `fastrpc-adsp`, `fastrpc-gdsp` |
+| `-g` | `--gid` | from host paths | `gid` to grant via `additionalGids`, overriding the group read from each host device node and socket |
 | `-n` | `--dry-run` | off | Probe devices but do not write any files |
 | `-v` | `--verbose` | off | Increase verbosity; use `-vv` for debug output |
 
+### Device classes
+
+Each class becomes one CDI file and is written only when the hardware or
+host-side server it describes is actually present:
+
+> **Note:** a host with no DSP node at all (none of `/dev/fastrpc-cdsp*`,
+> `/dev/fastrpc-adsp*` or `/dev/fastrpc-gdsp*`) is not a target these specs are
+> for, and **nothing is written** — no `gpu`, `v4l2`, `camera`, `audio`,
+> `display` or `dmaheap` file either. A stale monolithic `qualcomm.json` is
+> still removed, and the run exits 0 after logging the reason.
+
+| Class | Device nodes | Mounts |
+|-------|--------------|--------|
+| `gpu` | `/dev/dri/renderD*`, `/dev/dri/card*`, `/dev/kgsl-3d*` | — |
+| `v4l2` | `/dev/video*` (all of them) | — |
+| `camera` | — | `/run/cam_server/le_camera_socket` |
+| `audio` | — | `/run/pulse/native`, else `/run/user/*/pulse/native` |
+| `display` | — | `/run/wayland-*`, else `/run/user/*/wayland-*` |
+| `dmaheap` | `/dev/dma_heap/*system` | — |
+| `fastrpc-cdsp` | `/dev/fastrpc-cdsp*` | [DSP firmware](#dsp-firmware-mounts), [board name](#board-name) |
+| `fastrpc-adsp` | `/dev/fastrpc-adsp*` | [DSP firmware](#dsp-firmware-mounts), [board name](#board-name) |
+| `fastrpc-gdsp` | `/dev/fastrpc-gdsp*` | [DSP firmware](#dsp-firmware-mounts), [board name](#board-name) |
+
+The three `fastrpc` rows also set `MACHINE_NAME` to the board name, the mounted
+devicetree node being the second way the same name is handed over; no other
+class sets a variable, see [Board name](#board-name).
+
+Each `fastrpc` class is the nodes of one DSP and the firmware of that DSP
+alone: `fastrpc-cdsp` the compute DSP, `fastrpc-adsp` the audio DSP and
+`fastrpc-gdsp` the DSP the host's `gdsprpcd` serves, exposed as
+`/dev/fastrpc-gdsp0` and `/dev/fastrpc-gdsp1` on a board that has it (an
+SA8775P). A board without one of those DSPs gets no file for it, as with every
+other class.
+
+#### GPU nodes
+
+The `gpu` class exposes the render node a container draws through, the DRM card
+node, and the Adreno KGSL node when the kernel provides one — some downstream
+kernels expose `/dev/kgsl-3d0` instead of routing everything through DRM. A
+board without it simply gets the render and card nodes.
+
+Each node is available under its own device name, and `gpu:all` hands over the
+whole stack at once. The render nodes are named after the nodes themselves
+(`renderD128`), while their catch-all is `render:all`, named after the node class
+rather than the `renderD` prefix the nodes are spelled with:
+
+```shell
+# docker run --device qualcomm.com/gpu=gpu:all --rm -it mycontainer
+```
+
+Note that the GPU nodes frequently span two groups — the render node belongs to
+`render` while the card node belongs to `video` — which is handled per node; see
+[Group access](#group-access).
+
+#### DMA heap names
+
+A target can expose the system heap under the plain name, the vendor-qualified
+devicetree spelling, or both:
+
+| Host node | Device name |
+|-----------|-------------|
+| `/dev/dma_heap/system` | `dmaheap-system` |
+| `/dev/dma_heap/qcom,system` | `dmaheap-system-qcom` |
+
+A node whose name is qualified with a vendor is named after that vendor, so the
+device says which heap it is. A positional name (`dmaheap-system0`) would not,
+and would move as soon as a node appears or goes away. The plain node keeps the
+bare `dmaheap-system` name whether or not the vendor one is there beside it,
+and `dmaheap-system:all` hands over every heap found.
+
+#### Socket-backed classes
+
+`camera`, `audio` and `display` pass through no device node. The container talks
+to the host camera server (qmmf/CamX), PulseAudio server and Wayland compositor
+over a unix socket, so the socket *is* the device and the spec carries a
+bind-mount instead of a `deviceNodes` entry. `v4l2` still exposes every
+`/dev/video*` node, encoders and decoders included, for a client that wants to
+drive V4L2 directly.
+
+Each socket is bind-mounted read-write — a socket is useless to a client that
+cannot write to it — and `nosuid,noexec`. Inside the container every socket
+appears at its system-wide location under `/run`, a fixed path a client is
+pointed at in full (`WAYLAND_DISPLAY=/run/wayland-0`,
+`PULSE_SERVER=unix:/run/pulse/native`); a socket the host keeps in a per-user
+runtime directory is lifted up to that path, see [Where the sockets are
+mounted](#where-the-sockets-are-mounted). The
+generator mounts the socket but does not set those variables, see [The
+container environment](#the-container-environment).
+
+##### The container environment
+
+**`MACHINE_NAME` is the only variable a generated spec sets, and only the
+three `fastrpc` specs set it** — see [Board name](#board-name). No other spec sets
+anything: what those classes pass through is a path, a device node or a socket,
+and the variable naming that path belongs to the image and the `docker run`
+command line.
+
+A client therefore has to be pointed at what the spec mounted. The stock images
+already resolve the mounted paths, so nothing extra is needed on an ordinary
+target; an image that does not, or one whose entrypoint clears the environment,
+needs the paths on the command line — otherwise it gets a mounted socket its
+client never looks at:
+
+| Variable | Value to pass |
+|----------|---------------|
+| `WAYLAND_DISPLAY` | `/run/wayland-0` |
+| `PULSE_SERVER` | `unix:/run/pulse/native` |
+
+Each value names the mounted socket in full:
+
+```shell
+# docker run --device qualcomm.com/display=display \
+#     --env WAYLAND_DISPLAY=/run/wayland-0 ...
+```
+
+A Wayland client given an absolute `WAYLAND_DISPLAY` connects to exactly that
+socket and does not consult `XDG_RUNTIME_DIR` at all, so the display takes one
+variable rather than two. **Do not override `XDG_RUNTIME_DIR`** to make a
+relative `WAYLAND_DISPLAY=wayland-0` resolve: setting it to `/run` moves the
+runtime directory for everything else in the image that looks a path up through
+it, and buys nothing the absolute form does not already give.
+
+The same applies to a board whose compositor serves a differently numbered
+socket: it keeps that basename through the mount, so the container sees
+`/run/wayland-1` and wants `WAYLAND_DISPLAY=/run/wayland-1`. The mount itself
+is correct either way. A host with a second user logged in has that user's
+displays mounted under a suffixed name (`/run/wayland-0-1`), and a container
+meant for that session has to be pointed at it; the same holds for a second
+audio socket, see [Two sockets wanting one container
+path](#two-sockets-wanting-one-container-path).
+
+##### Where the sockets are looked for
+
+`audio` and `display` can be laid out two ways on a target, so each is searched
+for in order and the **first pattern that matches anything wins**:
+
+| Class | Preferred (system-wide) | Fallback (per-user session) |
+|-------|-------------------------|-----------------------------|
+| `audio` | `/run/pulse/native` | `/run/user/*/pulse/native` |
+| `display` | `/run/wayland-*` | `/run/user/*/wayland-*` |
+
+A system-wide sound server or compositor puts its socket directly under `/run`,
+which is checked first; a session one puts it in the user runtime directory,
+which is the fallback. The runtime directory is globbed rather than pinned to
+uid 1000, so a target running these servers as another user is still picked up.
+
+Stopping at the first match matters: if both layouts are present, only the
+system-wide socket is mounted, rather than handing the container the same
+compositor twice under two different paths. Within the winning pattern every
+match is kept, so a compositor exposing `wayland-0` and `wayland-1` passes both
+through.
+
+What a pattern matches that is not a socket is dropped first. A compositor keeps
+a lock file next to every socket it serves, so `/run/user/*/wayland-*` also
+matches `/run/user/1000/wayland-1.lock`; mounting that would hand the container
+a path no client connects to, and the host compositor's lock to take. Any
+`.lock` match is therefore left out, and a runtime directory holding nothing but
+a stale lock file does not count as a match at all — the next pattern still gets
+its turn. Adjust `SOCKET_IGNORE_SUFFIXES` in the generator to drop more.
+
+`camera` has one location, `/run/cam_server/le_camera_socket`.
+
+##### Every login's displays and sound servers
+
+`display` and `audio` are both served per session, and both collide on the way
+in. A Wayland socket is numbered **per runtime directory, not per machine** — a
+compositor calls its first socket `wayland-0` whatever any other compositor on
+the host has called its own — and a PulseAudio socket is the constant `native`
+in every session. A target with two users logged in next to a display manager
+therefore has:
+
+```
+/run/user/123/wayland-0        /run/user/123/pulse/native     (the greeter's)
+/run/user/1000/wayland-0       /run/user/1000/pulse/native    (the first user's)
+/run/user/1000/wayland-1
+/run/user/1001/wayland-0       /run/user/1001/pulse/native    (the second user's)
+/run/user/1001/wayland-1
+```
+
+**Every regular login's sockets are passed through** — two users logged in at
+once means two compositors and two sound servers worth reaching, and the
+container is handed both rather than whichever one the generator preferred.
+Within a session the compositor does its own numbering, so `wayland-0` and
+`wayland-1` keep the numbers the host gave them; between sessions the sockets
+ask for one container path and the later one is given a suffixed mount point,
+see [Two sockets wanting one container
+path](#two-sockets-wanting-one-container-path):
+
+| Host path | Container path |
+|-----------|----------------|
+| `/run/user/1000/wayland-0` | `/run/wayland-0` |
+| `/run/user/1000/wayland-1` | `/run/wayland-1` |
+| `/run/user/1001/wayland-0` | `/run/wayland-0-1` |
+| `/run/user/1001/wayland-1` | `/run/wayland-1-1` |
+| `/run/user/1000/pulse/native` | `/run/pulse/native` |
+| `/run/user/1001/pulse/native` | `/run/pulse/native-1` |
+
+**A system account's session is dropped**, the greeter's above being the one
+most targets have: its compositor is not what a container is meant to draw on,
+nor its sound server what a container is meant to play through, and passing
+either through would spend the unsuffixed name on it. `SESSION_UID_MIN` (1000)
+is the floor, and the sockets left out are logged:
+
+```
+INFO: Skipping 1 display socket(s) in /run/user/123: uid 123 is a system account, not a login of uid 1000 or above
+INFO: Skipping 1 audio socket(s) in /run/user/123/pulse: uid 123 is a system account, not a login of uid 1000 or above
+```
+
+The uid is only ranked with, never pinned, so a target whose users run as
+something other than 1000 is handled the same way, and a host running nothing
+but system sessions keeps them after all — those servers are the only ones
+there are. Sockets are mounted **lowest session uid first**, so which session
+keeps the unsuffixed `/run/wayland-<n>` or `/run/pulse/native` does not depend
+on which one came up first.
+
+Each session's socket brings its own owning group, and the spec grants all of
+them, so a container can connect to whichever one it is pointed at; see [Group
+access](#group-access).
+
+Both classes are filtered this way (`SOCKET_LOGIN_SESSION_CLASSES` in the
+generator). `camera` is not: its server has one system-wide socket and no
+sessions to tell apart.
+
+##### Where the sockets are mounted
+
+Every socket is handed to the container at its **system-wide location under
+`/run`**, whatever the host layout. Nothing in the container resolves
+`/run/user/<uid>`: a client there is pointed at `/run/wayland-0` and
+`/run/pulse/native`, the paths the stock images already resolve.
+
+| Host path | Container path |
+|-----------|----------------|
+| `/run/pulse/native` | unchanged |
+| `/run/user/*/pulse/native` | `/run/pulse/native` |
+| `/run/wayland-*` | unchanged |
+| `/run/user/*/wayland-*` | `/run/wayland-*` |
+| `/run/cam_server/le_camera_socket` | unchanged |
+
+A host that already serves the socket from `/run` needs no remapping — both
+sides of the mount name the same path. Only the per-user layouts are rewritten,
+to lift the socket out of the session directory. The container side therefore
+never reveals which user the host session belonged to: a target with one
+session running as 1001 produces the same spec as one running as 1000, and
+where two sessions want one path the later mount point takes a counted suffix
+rather than a uid (see below).
+
+The basename is preserved, so a second display of one session on
+`/run/user/1000/wayland-1` lands on `/run/wayland-1` and the two do not
+collide. Two *sessions* do collide, since each compositor numbers from zero;
+see below.
+
+##### Two sockets wanting one container path
+
+The rewrite keeps only the basename, so two host sockets can ask for the same
+container path, and a host with more than one session has that both ways:
+
+* an audio socket's basename is the constant `native`, and the uid was all that
+  told `/run/user/1000/pulse/native` and `/run/user/1001/pulse/native` apart,
+* a display socket is numbered by its own compositor from zero, so
+  `/run/user/1000/wayland-0` and `/run/user/1001/wayland-0` both ask for
+  `/run/wayland-0`.
+
+**Both are suffixed** `-1`, `-2`, … on the mount point, so no session's socket
+is dropped, none overrides another, and every one of them still sits in the
+directory its client looks in. Which sockets are separated this way is
+`SOCKET_COLLISION_SUFFIXED` in the generator:
+
+| Host path | Container path |
+|-----------|----------------|
+| `/run/user/1000/pulse/native` | `/run/pulse/native` |
+| `/run/user/1001/pulse/native` | `/run/pulse/native-1` |
+| `/run/user/1000/wayland-0` | `/run/wayland-0` |
+| `/run/user/1001/wayland-0` | `/run/wayland-0-1` |
+
+Only a regular login's sockets get this far, a system account's having been
+dropped before the mounts are built (see [Every login's displays and sound
+servers](#every-logins-displays-and-sound-servers)).
+
+Every name assigned is logged:
+
+```
+INFO: Container path /run/wayland-0 is already mounted, using /run/wayland-0-1
+```
+
+Display sockets are taken lowest session uid first and audio sockets in sorted
+order, so which one goes unsuffixed is stable across runs. It is the unsuffixed
+path that lets a stock image connect with no configuration; a container that
+wants one of the others is pointed at it with
+`PULSE_SERVER=unix:/run/pulse/native-1` or
+`WAYLAND_DISPLAY=/run/wayland-0-1`. The counter also walks past a path already
+taken, so a host genuinely serving `native-1` is not collided with.
+
+> **Note:** the suffix is a disambiguator, **not a session number**. The counter
+> runs per container path, so a session whose `wayland-1` collides with nothing
+> keeps the bare `/run/wayland-1` while its `wayland-0` is suffixed. The `-1` in
+> `/run/wayland-0-1` and in `/run/pulse/native-1` need not be the same session
+> either. The spec's `hostPath` is what says which session a mount came from.
+
+A socket matching none of those patterns — the camera server's — keeps the
+container path it was given. No layout the generator globs puts two of them on
+one path, since one host path is globbed once, but should it ever happen the
+spec carries both mounts and the later one shadows the earlier, so only one
+socket is reachable. The run then warns which path was taken twice and which
+host socket won it, rather than leaving that to be guessed at.
+
+A single-session host — every ordinary target — has nothing to separate, so its
+socket is simply mounted at `/run/pulse/native` or `/run/wayland-0`.
+
+The per-user runtime directory is not handed over as a directory, which is what
+makes this a path rewrite rather than one mount: it cannot be placed on `/run`
+without shadowing the container's own `/run`. Adjust `SOCKET_CONTAINER_DIRS` in
+the generator for an image that resolves its sockets somewhere else.
+
+A class whose socket is missing is skipped, exactly as a class whose device
+nodes are missing is: the host-side server is not running, so the spec would
+hand the container a path it cannot connect to. The socket's owning group is
+read and granted the same way a device node's is, since the container has to be
+in that group to connect.
+
+```shell
+# docker run --device qualcomm.com/camera=camera --device qualcomm.com/audio=audio \
+      --device qualcomm.com/display=display --rm -it mycontainer
+```
+
+> **Note:** a target that puts these sockets somewhere neither pattern covers
+> needs `CLASS_SOCKETS` in the generator adjusted.
+
+#### DSP firmware mounts
+
+The three `fastrpc` classes carry bind-mounts for the Hexagon DSP firmware on
+top of their device nodes, because those binaries are tightly coupled to the
+files the in-kernel firmware loader loads; mounting the host's copies keeps the
+container from running a mismatched pair.
+
+**Only the firmware files themselves are mounted** — the host directory they
+were found in is not. A spec carries the handful of files its own FastRPC
+client opens, each under `/usr/share/hexagon-dsp/`, plus the board
+configuration that says where they came from.
+
+##### Which board's firmware
+
+The board says so itself. The hexagon-dsp packaging installs a YAML file per
+board family in a `conf.d`, naming a firmware directory per devicetree model:
+
+```yaml
+# /usr/share/qcom/conf.d/hexagon-dsp-binaries-thundercomm-rb3gen2.yaml
+machines:
+  Qualcomm Technologies, Inc. Robotics RB3gen2:
+    DSP_LIBRARY_PATH: qcm6490/Thundercomm/RB3gen2/dsp
+```
+
+Both locations are searched, in this order — the first is where the
+qualcomm-linux images install it and the second where the package of that name
+does:
+
+| Configuration directory | `DSP_LIBRARY_PATH` is relative to |
+|-------------------------|-----------------------------------|
+| `/usr/share/qcom/conf.d` | `/usr/share/qcom` |
+| `/usr/share/hexagon-dsp/conf.d` | `/usr/share/hexagon-dsp` |
+
+The board name read off the devicetree (see [Board name](#board-name)) picks
+the entry, and `DSP_LIBRARY_PATH` resolved against the directory holding that
+`conf.d` is the firmware directory. For the file above that is
+`/usr/share/qcom/qcm6490/Thundercomm/RB3gen2/dsp`.
+
+**That `conf.d` is bind-mounted into the container at
+`/usr/share/hexagon-dsp/conf.d`**, read-only, whichever of the two locations the
+host keeps it in:
+
+| Host path | Container path |
+|-----------|----------------|
+| `/usr/share/qcom/conf.d` | `/usr/share/hexagon-dsp/conf.d` |
+| `/usr/share/hexagon-dsp/conf.d` | unchanged |
+
+So a container resolves one path for the configuration as it does for the
+firmware, and needs to know nothing about the host's layout. It is the one
+directory a `fastrpc` spec mounts, and whatever resolves `DSP_LIBRARY_PATH`
+inside the container reads the same file the generator read rather than a copy
+the image shipped for some other board.
+
+Where a host has **both** locations, the one holding the file that named this
+board is the one handed over — only one can be, both arriving at a single
+container path, and the container needs the file its own board is in. If
+nothing named the board, the first in search order is passed through; there is
+nothing to choose between them then.
+
+The file is parsed by the generator itself rather than with a YAML library: the
+service runs on a target with nothing but the Python standard library, so a
+dependency on a package the image may not carry is not an option. Only the one
+shape above is read — the `machines` mapping, its model keys and their
+settings — and the SPDX header, the schema annotation and any other top-level
+section are passed over.
+
+**An image carrying no configuration** falls back to the symlinks the rpcd
+services leave behind. `cdsprpcd`, `adsprpcd` and `gdsprpcd` each symlink one
+board's `dsp/<dsp>/*` into `/usr/lib/dsp/<dsp>/` on startup, so resolving
+`/usr/lib/dsp/*/*` leads back to the directory they picked — the same answer,
+one step removed. A target that installs real files there instead of symlinks
+resolves to those files, which says the same thing.
+
+**A host where neither answers gets no firmware mounts**, and nothing is
+looked for past them. Its `fastrpc` specs are still written — the device nodes
+and the board name do not depend on the firmware — and the run says so:
+
+```
+WARNING: Neither the DSP configuration nor /usr/lib/dsp names a firmware directory for 'Arduino Monza'; the fastrpc specs carry no firmware
+```
+
+That is deliberate. Looking for a firmware directory nothing pointed at means,
+on an image built for a family of targets, finding another board's — and
+firmware built for a different SoC is worse than no firmware, being exactly the
+mismatch mounting the host's copies is meant to avoid. The same rule holds once
+a board *has* answered: a class whose firmware is missing from the resolved
+directory is a DSP the image installed none for, and no other directory is
+substituted for it.
+
+The run says which way it went and what it resolved:
+
+```
+INFO: Found DSP configuration directory: /usr/share/qcom/conf.d
+INFO: /usr/share/qcom/conf.d/hexagon-dsp-binaries-thundercomm-rb3gen2.yaml sets DSP_LIBRARY_PATH=qcm6490/Thundercomm/RB3gen2/dsp for 'Qualcomm Technologies, Inc. Robotics RB3gen2'
+INFO: Resolving 'fastrpc-cdsp' firmware from /usr/share/qcom/qcm6490/Thundercomm/RB3gen2/dsp
+INFO: Mounting DSP configuration directory /usr/share/qcom/conf.d into the container at /usr/share/hexagon-dsp/conf.d
+```
+
+or, on an image with no configuration:
+
+```
+INFO: No DSP configuration directory (/usr/share/qcom/conf.d, /usr/share/hexagon-dsp/conf.d)
+INFO: /usr/lib/dsp/cdsp/fastrpc_shell_3 resolves the DSP firmware directory /usr/share/qcom/qcm6490/Thundercomm/RB3gen2/dsp
+```
+
+Adjust `DSP_CONF_DIRS` in the generator for an image that keeps the
+configuration somewhere else.
+
+##### Which files are mounted
+
+The files the FastRPC client opens are mounted under
+**`/usr/share/hexagon-dsp/`**, one fixed location whatever board-specific
+directory the host kept them in, each keeping its per-DSP sub-path and nothing
+else of where it was found. They are per DSP, so each class is given its own
+and no spec carries another's:
+
+| Class | File | Mounted at |
+|-------|------|------------|
+| `fastrpc-cdsp` | `cdsp*/fastrpc_shell_*` | `/usr/share/hexagon-dsp/cdsp*/fastrpc_shell_*` |
+| `fastrpc-cdsp` | `cdsp*/libc++.so.1` | `/usr/share/hexagon-dsp/cdsp*/libc++.so.1` |
+| `fastrpc-cdsp` | `cdsp*/libc++abi.so.1` | `/usr/share/hexagon-dsp/cdsp*/libc++abi.so.1` |
+| `fastrpc-adsp` | `adsp*/fastrpc_shell_*` | `/usr/share/hexagon-dsp/adsp*/fastrpc_shell_*` |
+| `fastrpc-adsp` | `adsp*/libc++.so.1` | `/usr/share/hexagon-dsp/adsp*/libc++.so.1` |
+| `fastrpc-adsp` | `adsp*/libc++abi.so.1` | `/usr/share/hexagon-dsp/adsp*/libc++abi.so.1` |
+| `fastrpc-gdsp` | `gdsp*/fastrpc_shell_*` | `/usr/share/hexagon-dsp/gdsp*/fastrpc_shell_*` |
+| `fastrpc-gdsp` | `gdsp*/libc++.so.1` | `/usr/share/hexagon-dsp/gdsp*/libc++.so.1` |
+| `fastrpc-gdsp` | `gdsp*/libc++abi.so.1` | `/usr/share/hexagon-dsp/gdsp*/libc++abi.so.1` |
+
+These are the files the rpcd services symlink into `/usr/lib/dsp/<dsp>/` on the
+host, reached by a bind-mount instead because the container image carries no DSP
+firmware of its own.
+
+The sub-path and basename are preserved, so `fastrpc_shell_3` and
+`fastrpc_shell_unsigned_3` both appear under their own name. The `*` after the
+DSP name is a wildcard for the multi-DSP targets, which keep one firmware
+directory per DSP: an SA8775P carries `cdsp/fastrpc_shell_3` alongside
+`cdsp1/fastrpc_shell_4`, matching its `/dev/fastrpc-cdsp` and
+`/dev/fastrpc-cdsp1` nodes, and both land under their own sub-path of
+`/usr/share/hexagon-dsp/`. The mounts are read-write, as the hand-maintained
+specs they replace have them.
+
+A file with no match is skipped, so a board carrying only the unsigned shell
+gets only that. A class with no firmware at all gets no firmware mount, and
+its spec is still written for the device nodes and the board name.
+
+They are looked for in the directory the board resolved to. Where that is
+several candidates — symlinks resolving to more than one directory — the first
+providing a file wins, two mounts on one container path being a conflicting
+spec.
+
+Adjust `DSP_FIRMWARE_FILES` in the generator for a target whose FastRPC stack
+resolves more files by path, and `DSP_FIRMWARE_CONTAINER_DIR` for an image that
+looks for them somewhere other than `/usr/share/hexagon-dsp`.
+
+##### Board name
+
+The three `fastrpc` specs are the only ones that hand over the board name, and
+they hand it over two ways: as the `MACHINE_NAME` variable they set, and as the
+devicetree model node they bind-mount. The FastRPC library derives the name to
+resolve its Hexagon binary paths, taking it from the variable when it is set and
+reading the node itself otherwise, so a client is served whichever way it looks.
+
+The generator reads the name off the host devicetree — the same read that picks
+the board's entry in the DSP configuration, see [Which board's
+firmware](#which-boards-firmware) — and sets it on each of those specs:
+
+```json
+  "containerEdits": {
+    "env": [
+      "MACHINE_NAME=Arduino Monza"
+    ]
+```
+
+No other class sets it. Nothing in them resolves a path against a board name,
+and a variable in their specs would be exported into every container that asks
+for a GPU or a camera — a reach into the image's environment that passing a
+device node through does not call for.
+
+The node is mounted as well because a container cannot count on reaching `/sys`,
+runtimes filtering it, and because a variable can be cleared or overridden by an
+image's entrypoint:
+
+```json
+          {
+            "hostPath": "/sys/firmware/devicetree/base/model",
+            "containerPath": "/run/device-model",
+            "options": [
+              "rbind",
+              "ro"
+            ]
+          }
+```
+
+The mount is read-only — nothing in the container has any business writing a
+board name back — and a recursive bind, so it resolves the sysfs node itself
+rather than whatever mount point it sits under.
+
+The mount names the node and never the string it holds, so what a container
+reads through it is whatever board it is running on. The variable does carry the
+string, read when the file was written, which is as current as the file itself:
+`qualcomm-cdi-generator.service` regenerates every spec from scratch on each
+boot, so the name cannot outlive the board it was read from.
+
+A host with no model node, or one whose node cannot be read, gets no variable
+and no mount — the `fastrpc` specs are still written, since the DSP nodes and
+their firmware do not depend on the board name, and an empty `MACHINE_NAME`
+would be worse than none for a client resolving firmware paths against it.
+
 ### Group access
 
-A generated `deviceNodes` entry is the node's path alone. The runtime resolves
-the rest from the host node it was given — type, major/minor and permissions —
-so the spec says nothing about ownership or modes and nothing on the host is
-changed.
+A generated `deviceNodes` entry is the path alone. The runtime resolves the rest
+from the host node it was given — type, major/minor and permissions — so the
+spec says nothing about ownership or modes and nothing on the host is changed.
 
 What the spec does carry is `containerEdits.additionalGids`: the groups owning
-the host nodes the class passes through, added to the container's supplementary
-groups. That is what makes a group-accessible node reachable when the runtime
-bind-mounts the host node rather than re-creating it, without relaxing a mode
-on either side.
+the host paths the class passes through, added to the container's supplementary
+groups. That is what makes a group-accessible resource reachable — a sound
+server socket bind-mounted with the host's permissions on it, or a device node
+the runtime bind-mounts rather than re-creates — without relaxing a mode on
+either side.
 
-Access is expressed entirely within the CDI spec. The generator does not install
-a `createContainer` hook and never changes the permissions of the host device
-nodes.
+Access is expressed entirely within the CDI spec: the generated files carry no
+`hooks`, so nothing of the generator's runs on the host at container start, and
+the permissions of the host device nodes are never changed.
 
-The group is read from the host device node, because that is the group the
-driver and its udev rules actually hand the device to, and it varies per board —
-a render node is `render` on one target and the container user's primary group
-on another. Reading it keeps the spec matched to the hardware it was generated
-on instead of a compiled-in guess. The generator only reads the node's group; it
-does not change it.
+The group is read from the host path, because that is the group the driver and
+its udev rules actually hand the device to, and it varies per board — a render
+node is `render` on one target and the container user's primary group on
+another. Reading it keeps the spec matched to the hardware it was generated on
+instead of a compiled-in guess. The generator only reads the group; it does not
+change it.
 
-The group is resolved **per node**, not per class, because one class can span
+The group is resolved **per path**, not per class, because one class can span
 several groups on a single board — a target may expose `/dev/video32` in `video`
-while a camera node alongside it belongs to a vendor group:
+while a node alongside it belongs to a vendor group:
 
 ```
 INFO: Groups for 'v4l2' nodes: 44 (30 node(s)), 1002 (2 node(s))
 ```
 
-The spec grants every one of them:
+The spec then grants every one of them:
 
 ```json
   "containerEdits": {
@@ -135,10 +671,10 @@ The spec grants every one of them:
   }
 ```
 
-Granting only the most common group would leave exactly the nodes that differ
-unopenable inside the container.
+Granting only the most common group would leave exactly the paths that differ
+unreachable inside the container.
 
-A node falls back to a built-in per-class default when it has no group of its
+A path falls back to a built-in per-class default when it has no group of its
 own — it could not be read, or it is owned by group `root` (a `root:root` node
 has no group to join, and the runtime drops a `0` entry from `additionalGids`,
 so honouring it would grant an unprivileged container nothing):
@@ -147,9 +683,16 @@ so honouring it would grant an unprivileged container nothing):
 |-------|----------------|-----------|
 | `gpu` | 1000 | render node handed to the container user's primary group |
 | `v4l2` | 44 | V4L2 nodes conventionally belong to the `video` group |
+| `camera` | 1000 | camera socket in the runtime dir, owned by that user's group |
+| `audio` | 1000 | audio socket in the user runtime dir, owned by that user's group |
+| `display` | 1000 | Wayland socket in the user runtime dir, likewise |
 | `dmaheap` | 1000 | DMA heap handed to the container user's primary group |
 | `fastrpc-cdsp` | 1000 | Hexagon DSP node handed to the container user's primary group |
 | `fastrpc-adsp` | 1000 | Hexagon DSP node handed to the container user's primary group |
+| `fastrpc-gdsp` | 1000 | Hexagon DSP node handed to the container user's primary group |
+
+For the socket-backed classes the group is read from the socket rather than a
+device node; everything else about the resolution is identical.
 
 Override the resolution for all classes at once:
 
@@ -157,22 +700,41 @@ Override the resolution for all classes at once:
 # qualcomm-cdi-generator.py --gid 1000
 ```
 
-`--gid` replaces the group read from the host nodes for every node and class, so
+`--gid` replaces the group read from the host paths for every path and class, so
 the spec grants exactly that one group.
 
 ### Example session
+
+Captured on a board with no `gdsp` nodes, so there is no `fastrpc-gdsp` file. A
+run also logs the `DSP_LIBRARY_PATH` it read and the directory each DSP class
+resolved its firmware from, after the configuration directory below — see
+[Which board's firmware](#which-boards-firmware).
 
 ```shell
 (cdi) root@ventunoq:~# qualcomm-cdi-generator.py -v
 INFO: Starting Qualcomm CDI generation
 INFO: Config: destdir=/, cdifilename=qualcomm.json, dry_run=False
-INFO: Groups to grant: from the host device nodes
+INFO: Groups to grant: from the host device nodes and sockets
 INFO: Found 1 nodes for pattern /dev/dri/renderD*
-INFO: Group for 'gpu' nodes: 1000
+INFO: Found 1 nodes for pattern /dev/dri/card*
+INFO: Found 1 nodes for pattern /dev/kgsl-3d*
+INFO: Groups for 'gpu' nodes: 44 (1 path(s)), 110 (2 path(s))
 INFO: Generating CDI entries for 'renderD' with 1 node(s)
+INFO: Generating CDI entries for 'card' with 1 node(s)
+INFO: Generating CDI entries for 'kgsl-3d' with 1 node(s)
+INFO: Generating CDI entries for 'gpu' with 3 node(s)
 INFO: Found 30 nodes for pattern /dev/video*
 INFO: Group for 'v4l2' nodes: 44
 INFO: Generating CDI entries for 'video' with 30 node(s)
+INFO: Found camera socket: /run/cam_server/le_camera_socket
+INFO: Group for 'camera' sockets: 1002
+INFO: Generating CDI entries for 'camera' with 1 socket(s)
+INFO: Found audio socket: /run/user/1000/pulse/native
+INFO: Group for 'audio' sockets: 29
+INFO: Generating CDI entries for 'audio' with 1 socket(s)
+INFO: Found display socket: /run/user/1000/wayland-0
+INFO: Group for 'display' sockets: 1000
+INFO: Generating CDI entries for 'display' with 1 socket(s)
 INFO: Found 1 nodes for pattern /dev/dma_heap/*system
 INFO: Group for 'dmaheap' nodes: 1000
 INFO: Generating CDI entries for 'dmaheap-system' with 1 node(s)
@@ -183,12 +745,18 @@ INFO: Found 1 nodes for pattern /dev/fastrpc-adsp*
 INFO: Group for 'fastrpc-adsp' nodes: 1000
 INFO: Generating CDI entries for 'fastrpc-adsp' with 1 node(s)
 INFO: Detected Arduino Monza from devicetree
-INFO: Found 14 nodes for pattern /usr/share/*/*/*/*/dsp/
+INFO: Mounting the devicetree model /sys/firmware/devicetree/base/model into the container at /run/device-model
+INFO: Found DSP configuration directory: /usr/share/qcom/conf.d
 WARNING: Old style monolithic CDI detected, removing /run/cdi/qualcomm.json
 INFO: Wrote CDI JSON: /run/cdi/qualcomm-gpu.json
 INFO: Wrote CDI JSON: /run/cdi/qualcomm-v4l2.json
+INFO: Wrote CDI JSON: /run/cdi/qualcomm-camera.json
+INFO: Wrote CDI JSON: /run/cdi/qualcomm-audio.json
+INFO: Wrote CDI JSON: /run/cdi/qualcomm-display.json
 INFO: Wrote CDI JSON: /run/cdi/qualcomm-dmaheap.json
+INFO: Setting MACHINE_NAME=Arduino Monza in the 'fastrpc-cdsp' spec
 INFO: Wrote CDI JSON: /run/cdi/qualcomm-fastrpc-cdsp.json
+INFO: Setting MACHINE_NAME=Arduino Monza in the 'fastrpc-adsp' spec
 INFO: Wrote CDI JSON: /run/cdi/qualcomm-fastrpc-adsp.json
 INFO: Completed Qualcomm CDI generation
 (cdi) root@ventunoq:~# docker info
@@ -198,14 +766,23 @@ Server:
   /etc/cdi
   /var/run/cdi
  Discovered Devices:
+  cdi: qualcomm.com/audio=audio
+  cdi: qualcomm.com/audio=audio:all
+  cdi: qualcomm.com/camera=camera
+  cdi: qualcomm.com/camera=camera:all
+  cdi: qualcomm.com/display=display
+  cdi: qualcomm.com/display=display:all
   cdi: qualcomm.com/dmaheap=dmaheap-system
   cdi: qualcomm.com/dmaheap=dmaheap-system:all
   cdi: qualcomm.com/fastrpc-adsp=fastrpc-adsp
   cdi: qualcomm.com/fastrpc-adsp=fastrpc-adsp:all
   cdi: qualcomm.com/fastrpc-cdsp=fastrpc-cdsp
   cdi: qualcomm.com/fastrpc-cdsp=fastrpc-cdsp:all
+  cdi: qualcomm.com/gpu=card0
+  cdi: qualcomm.com/gpu=gpu:all
+  cdi: qualcomm.com/gpu=kgsl-3d0
+  cdi: qualcomm.com/gpu=render:all
   cdi: qualcomm.com/gpu=renderD128
-  cdi: qualcomm.com/gpu=renderD:all
   cdi: qualcomm.com/v4l2=video0
   cdi: qualcomm.com/v4l2=video1
   cdi: qualcomm.com/v4l2=video10
@@ -240,63 +817,79 @@ Server:
 [...]
 (cdi) root@ventunoq:~# cdi classes
 CDI device classes found:
-  0. dmaheap (1 vendors: qualcomm.com)
-  1. fastrpc-adsp (1 vendors: qualcomm.com)
-  2. fastrpc-cdsp (1 vendors: qualcomm.com)
-  3. gpu (1 vendors: qualcomm.com)
-  4. v4l2 (1 vendors: qualcomm.com)
+  0. audio (1 vendors: qualcomm.com)
+  1. camera (1 vendors: qualcomm.com)
+  2. display (1 vendors: qualcomm.com)
+  3. dmaheap (1 vendors: qualcomm.com)
+  4. fastrpc-adsp (1 vendors: qualcomm.com)
+  5. fastrpc-cdsp (1 vendors: qualcomm.com)
+  6. gpu (1 vendors: qualcomm.com)
+  7. v4l2 (1 vendors: qualcomm.com)
 (cdi) root@ventunoq:~# cdi devices
 CDI devices found:
-  0. qualcomm.com/dmaheap=dmaheap-system
-  1. qualcomm.com/dmaheap=dmaheap-system:all
-  2. qualcomm.com/fastrpc-adsp=fastrpc-adsp
-  3. qualcomm.com/fastrpc-adsp=fastrpc-adsp:all
-  4. qualcomm.com/fastrpc-cdsp=fastrpc-cdsp
-  5. qualcomm.com/fastrpc-cdsp=fastrpc-cdsp:all
-  6. qualcomm.com/gpu=renderD128
-  7. qualcomm.com/gpu=renderD:all
-  8. qualcomm.com/v4l2=video0
-  9. qualcomm.com/v4l2=video1
-  10. qualcomm.com/v4l2=video10
-  11. qualcomm.com/v4l2=video11
-  12. qualcomm.com/v4l2=video12
-  13. qualcomm.com/v4l2=video13
-  14. qualcomm.com/v4l2=video14
-  15. qualcomm.com/v4l2=video15
-  16. qualcomm.com/v4l2=video16
-  17. qualcomm.com/v4l2=video17
-  18. qualcomm.com/v4l2=video18
-  19. qualcomm.com/v4l2=video19
-  20. qualcomm.com/v4l2=video2
-  21. qualcomm.com/v4l2=video20
-  22. qualcomm.com/v4l2=video21
-  23. qualcomm.com/v4l2=video22
-  24. qualcomm.com/v4l2=video23
-  25. qualcomm.com/v4l2=video24
-  26. qualcomm.com/v4l2=video25
-  27. qualcomm.com/v4l2=video26
-  28. qualcomm.com/v4l2=video27
-  29. qualcomm.com/v4l2=video28
-  30. qualcomm.com/v4l2=video29
-  31. qualcomm.com/v4l2=video3
-  32. qualcomm.com/v4l2=video4
-  33. qualcomm.com/v4l2=video5
-  34. qualcomm.com/v4l2=video6
-  35. qualcomm.com/v4l2=video7
-  36. qualcomm.com/v4l2=video8
-  37. qualcomm.com/v4l2=video9
-  38. qualcomm.com/v4l2=video:all
+  0. qualcomm.com/audio=audio
+  1. qualcomm.com/audio=audio:all
+  2. qualcomm.com/camera=camera
+  3. qualcomm.com/camera=camera:all
+  4. qualcomm.com/display=display
+  5. qualcomm.com/display=display:all
+  6. qualcomm.com/dmaheap=dmaheap-system
+  7. qualcomm.com/dmaheap=dmaheap-system:all
+  8. qualcomm.com/fastrpc-adsp=fastrpc-adsp
+  9. qualcomm.com/fastrpc-adsp=fastrpc-adsp:all
+  10. qualcomm.com/fastrpc-cdsp=fastrpc-cdsp
+  11. qualcomm.com/fastrpc-cdsp=fastrpc-cdsp:all
+  12. qualcomm.com/gpu=card0
+  13. qualcomm.com/gpu=gpu:all
+  14. qualcomm.com/gpu=kgsl-3d0
+  15. qualcomm.com/gpu=render:all
+  16. qualcomm.com/gpu=renderD128
+  17. qualcomm.com/v4l2=video0
+  18. qualcomm.com/v4l2=video1
+  19. qualcomm.com/v4l2=video10
+  20. qualcomm.com/v4l2=video11
+  21. qualcomm.com/v4l2=video12
+  22. qualcomm.com/v4l2=video13
+  23. qualcomm.com/v4l2=video14
+  24. qualcomm.com/v4l2=video15
+  25. qualcomm.com/v4l2=video16
+  26. qualcomm.com/v4l2=video17
+  27. qualcomm.com/v4l2=video18
+  28. qualcomm.com/v4l2=video19
+  29. qualcomm.com/v4l2=video2
+  30. qualcomm.com/v4l2=video20
+  31. qualcomm.com/v4l2=video21
+  32. qualcomm.com/v4l2=video22
+  33. qualcomm.com/v4l2=video23
+  34. qualcomm.com/v4l2=video24
+  35. qualcomm.com/v4l2=video25
+  36. qualcomm.com/v4l2=video26
+  37. qualcomm.com/v4l2=video27
+  38. qualcomm.com/v4l2=video28
+  39. qualcomm.com/v4l2=video29
+  40. qualcomm.com/v4l2=video3
+  41. qualcomm.com/v4l2=video4
+  42. qualcomm.com/v4l2=video5
+  43. qualcomm.com/v4l2=video6
+  44. qualcomm.com/v4l2=video7
+  45. qualcomm.com/v4l2=video8
+  46. qualcomm.com/v4l2=video9
+  47. qualcomm.com/v4l2=video:all
 ```
 
 You can then pass one or more of the above entries to the runtime:
 ```shell
 (cdi) root@ventunoq:~# docker run --network host --device qualcomm.com/gpu=renderD128 --device=qualcomm.com/fastrpc-cdsp=fastrpc-cdsp:all --rm -it aiml-container:latest /bin/bash
 ```
-When using a CDI device, the container will automatically get additional metadata, for example the `MACHINE_NAME` environment variable:
+When using a `fastrpc` CDI device, the container also gets the board name the
+FastRPC library looks for, as a variable and as the mounted devicetree node
+(see [Board name](#board-name)):
 ```shell
 (cdi) root@ventunoq:~# docker run --network host --device=qualcomm.com/fastrpc-cdsp=fastrpc-cdsp:all --rm -it aiml-container:latest /bin/bash
-root@container:/# env | grep MACHINE
-MACHINE_NAME=Arduino Monza
+root@container:/# echo $MACHINE_NAME
+Arduino Monza
+root@container:/# cat /run/device-model
+Arduino Monza
 ```
 
 To generate only the fastrpc classes:
@@ -304,13 +897,27 @@ To generate only the fastrpc classes:
 (cdi) root@ventunoq:~# qualcomm-cdi-generator.py --classes fastrpc-cdsp,fastrpc-adsp -v
 INFO: Starting Qualcomm CDI generation
 INFO: Config: destdir=/, cdifilename=qualcomm.json, dry_run=False
-INFO: Groups to grant: from the host device nodes
+INFO: Groups to grant: from the host device nodes and sockets
 INFO: Found 1 nodes for pattern /dev/dri/renderD*
-INFO: Group for 'gpu' nodes: 1000
+INFO: Found 1 nodes for pattern /dev/dri/card*
+INFO: Found 1 nodes for pattern /dev/kgsl-3d*
+INFO: Groups for 'gpu' nodes: 44 (1 path(s)), 110 (2 path(s))
 INFO: Generating CDI entries for 'renderD' with 1 node(s)
+INFO: Generating CDI entries for 'card' with 1 node(s)
+INFO: Generating CDI entries for 'kgsl-3d' with 1 node(s)
+INFO: Generating CDI entries for 'gpu' with 3 node(s)
 INFO: Found 30 nodes for pattern /dev/video*
 INFO: Group for 'v4l2' nodes: 44
 INFO: Generating CDI entries for 'video' with 30 node(s)
+INFO: Found camera socket: /run/cam_server/le_camera_socket
+INFO: Group for 'camera' sockets: 1002
+INFO: Generating CDI entries for 'camera' with 1 socket(s)
+INFO: Found audio socket: /run/user/1000/pulse/native
+INFO: Group for 'audio' sockets: 29
+INFO: Generating CDI entries for 'audio' with 1 socket(s)
+INFO: Found display socket: /run/user/1000/wayland-0
+INFO: Group for 'display' sockets: 1000
+INFO: Generating CDI entries for 'display' with 1 socket(s)
 INFO: Found 1 nodes for pattern /dev/dma_heap/*system
 INFO: Group for 'dmaheap' nodes: 1000
 INFO: Generating CDI entries for 'dmaheap-system' with 1 node(s)
@@ -321,21 +928,61 @@ INFO: Found 1 nodes for pattern /dev/fastrpc-adsp*
 INFO: Group for 'fastrpc-adsp' nodes: 1000
 INFO: Generating CDI entries for 'fastrpc-adsp' with 1 node(s)
 INFO: Detected Arduino Monza from devicetree
-INFO: Found 14 nodes for pattern /usr/share/*/*/*/*/dsp/
+INFO: Mounting the devicetree model /sys/firmware/devicetree/base/model into the container at /run/device-model
+INFO: Found DSP configuration directory: /usr/share/qcom/conf.d
+INFO: Setting MACHINE_NAME=Arduino Monza in the 'fastrpc-cdsp' spec
 INFO: Wrote CDI JSON: /run/cdi/qualcomm-fastrpc-cdsp.json
+INFO: Setting MACHINE_NAME=Arduino Monza in the 'fastrpc-adsp' spec
 INFO: Wrote CDI JSON: /run/cdi/qualcomm-fastrpc-adsp.json
 INFO: Completed Qualcomm CDI generation
 ```
 
+Note that every class is still probed; `--classes` selects which CDI files are
+written, not what the generator looks at.
+
 ### CDI file structure
 
-The tool writes one JSON file per device class. Each file has a `kind` matching its class (e.g. `qualcomm.com/gpu`). A `deviceNodes` entry is the node's path alone, and the spec-level `containerEdits` sets `additionalGids` to every group owning one of the class's host nodes (see [Group access](#group-access)). The `fastrpc` files additionally include bind-mounts for Hexagon DSP firmware found under `/usr/share/*/*/*/*/dsp/` and the devicetree model string, since those binaries are tightly coupled to the in-kernel firmware loader.
+The tool writes one JSON file per device class (see [Device
+classes](#device-classes)). Each file has a `kind` matching its class (e.g. `qualcomm.com/gpu`). A `deviceNodes` entry is the node's path alone, and the spec-level `containerEdits` sets `additionalGids` to every group owning one of the class's host paths (see [Group access](#group-access)). The `fastrpc` files additionally include bind-mounts for the individual Hexagon firmware files their own DSP's FastRPC client opens, presented under `/usr/share/hexagon-dsp/` and taken from the board directory the hexagon-dsp configuration names, along with that configuration directory and no other directory of the firmware tree (see [DSP firmware mounts](#dsp-firmware-mounts)), since those binaries are tightly coupled to the in-kernel firmware loader, and the devicetree model node holding the board name (see [Board name](#board-name)). The `fastrpc` files are also the only ones carrying an `env` entry, `MACHINE_NAME`, which is the only variable any generated file sets (see [The container environment](#the-container-environment)).
 
 The specs declare `cdiVersion` `0.7.0`, the first CDI version that defines
 `additionalGids`; see [Minimum runtime versions](#minimum-runtime-versions) for
 the runtime releases that accept it.
 
-Example `qualcomm-gpu.json`:
+##### The generated-file note
+
+JSON has no comment syntax, so the "this file was generated" header rides in the
+spec's own `annotations` map, emitted between `kind` and `devices` where the
+comment would have gone:
+
+```json
+  "annotations": {
+    "qualcomm.com/generated-by": "qualcomm-cdi-generator",
+    "qualcomm.com/generated-note": "This file is generated from the devices discovered on this host. ..."
+  },
+```
+
+The keys are qualified with the vendor so they read like the `kind` they sit next
+to and cannot collide with another tool's metadata on the same spec. CDI defines
+`annotations` as specific to itself and not affecting container metadata, so the
+note describes the file to whoever reads it and never reaches the workload. It is
+omitted from the examples below for brevity; every generated file carries it.
+
+Only fields the CDI `Spec` struct declares may be emitted. The runtimes
+unmarshal these files with unknown fields disallowed and reject the whole spec on
+the first key they do not recognise, which costs the container every device in
+that class. The CDI JSON schema sets no `additionalProperties: false`, so neither
+it nor `cdi validate` catches a stray field; the test suite checks the emitted
+field names against the struct instead.
+
+The files are written formatted — two-space indentation, one trailing newline —
+so they can be read and diffed in place on target when a board does not expose
+what was expected. Runtimes parse this identically to a compact spec. The
+examples below match that structure, with the short string arrays folded onto
+one line for brevity; the generator puts each element on its own line.
+
+Example `qualcomm-gpu.json`, on a board whose render node is in `render` (110)
+and card node in `video` (44):
 ```json
 {
   "cdiVersion": "0.7.0",
@@ -350,19 +997,86 @@ Example `qualcomm-gpu.json`:
       }
     },
     {
-      "name": "renderD:all",
+      "name": "render:all",
       "containerEdits": {
         "deviceNodes": [
+          { "path": "/dev/dri/renderD128" }
+        ]
+      }
+    },
+    {
+      "name": "card0",
+      "containerEdits": {
+        "deviceNodes": [
+          { "path": "/dev/dri/card0" }
+        ]
+      }
+    },
+    {
+      "name": "gpu:all",
+      "containerEdits": {
+        "deviceNodes": [
+          { "path": "/dev/dri/card0" },
           { "path": "/dev/dri/renderD128" }
         ]
       }
     }
   ],
   "containerEdits": {
-    "env": [ "MACHINE_NAME=Qualcomm Technologies, Inc. Robotics RB3gen2" ],
-    "additionalGids": [ 1000 ]
+    "additionalGids": [ 44, 110 ]
   }
 }
+```
+
+A `/dev/kgsl-3d0` node, where present, appears alongside `card0` under its own
+`kgsl-3d0` name and in `gpu:all`.
+
+Example `qualcomm-audio.json`, where the socket mount rides on the device entry
+so that requesting the device is what mounts the socket. This host runs its
+audio session under uid 1001, so `hostPath` keeps that uid while
+`containerPath` is the system-wide location the container resolves (see [Where
+the sockets are mounted](#where-the-sockets-are-mounted)):
+```json
+{
+  "cdiVersion": "0.7.0",
+  "kind": "qualcomm.com/audio",
+  "devices": [
+    {
+      "name": "audio",
+      "containerEdits": {
+        "mounts": [
+          {
+            "hostPath": "/run/user/1001/pulse/native",
+            "containerPath": "/run/pulse/native",
+            "options": [ "nosuid", "noexec", "rw", "bind" ]
+          }
+        ]
+      }
+    }
+  ],
+  "containerEdits": {
+    "additionalGids": [ 1001 ]
+  }
+}
+```
+
+Note that `additionalGids` follows the **host** socket's owning group (1001
+here): the container has to join the group that owns the socket it is actually
+connecting to, whatever path it reaches it by.
+
+The `audio:all` entry is omitted above for brevity; it carries the same mount,
+so both spellings behave alike.
+
+`qualcomm-display.json` has the same shape, with the compositor's socket in
+place of the sound server's. Its spec-level `containerEdits` carries the group
+and nothing else — the compositor is reached through the mounted socket, and
+`MACHINE_NAME` is set by the `fastrpc` specs alone (see [The container
+environment](#the-container-environment)):
+
+```json
+  "containerEdits": {
+    "additionalGids": [ 1000 ]
+  }
 ```
 
 ## Validating generated CDI files
