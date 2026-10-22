@@ -25,7 +25,8 @@ import logging
 import argparse
 from typing import Callable
 
-known_classes = ['gpu', 'v4l2', 'dmaheap', 'fastrpc-cdsp', 'fastrpc-adsp']
+known_classes = ['gpu', 'v4l2', 'camera', 'audio', 'display', 'dmaheap',
+                 'fastrpc-cdsp', 'fastrpc-adsp']
 
 # CDI specification version emitted in every generated spec file. See the CNCF
 # Container Device Interface project for the format definition:
@@ -38,6 +39,38 @@ CDI_VERSION = "0.7.0"
 
 # CDI vendor namespace prefixed to every generated 'kind' (e.g. qualcomm.com/gpu)
 CDI_VENDOR = "qualcomm.com"
+
+# Host sockets bind-mounted into the container, per device class. These classes
+# are not reached through a device node at all: the container talks to a server
+# on the host over a unix socket, so the socket is the whole resource and the
+# spec carries a mount instead of a deviceNodes entry.
+#
+# The paths are the server-side defaults on a Qualcomm target:
+#   * PulseAudio accepts clients on the per-user runtime socket,
+#   * the camera server (qmmf/CamX) listens on /run/cam_server,
+#   * the Wayland compositor exposes its socket in the user runtime dir.
+# They are mounted at the same path inside the container so the usual client
+# defaults (PULSE_SERVER, WAYLAND_DISPLAY, XDG_RUNTIME_DIR) resolve unchanged.
+#
+# A class whose socket is absent is skipped, exactly as a class whose device
+# nodes are absent is: the server is not running, so the spec would hand the
+# container a path that cannot be connected to.
+CLASS_SOCKETS = {
+    'audio':   ['/run/user/1000/pulse/native'],
+    'camera':  ['/run/cam_server/le_camera_socket'],
+    'display': ['/run/user/1000/wayland-0'],
+}
+
+# Mount options for the sockets above. Unlike the DSP firmware mounts these are
+# read-write: a unix socket is useless to a client that cannot write to it.
+SOCKET_MOUNT_OPTIONS = ["nosuid", "noexec", "rw", "bind"]
+
+# V4L2 nodes that can belong to a camera. The kernel hands /dev/video0..31 to
+# camera drivers and uses the higher numbers for the video encode/decode nodes,
+# so the camera class only ever considers this range; see
+# find_camera_devicenodes() for the driver check that decides which of them are
+# really cameras.
+CAMERA_NODE_RANGE = range(0, 32)
 
 # Ownership and permissions applied to every generated deviceNodes entry. The
 # container runtime uses these to create the node inside the container, so they
@@ -53,22 +86,27 @@ CDI_VENDOR = "qualcomm.com"
 #
 # CLASS_GID is only the fallback for when a node has no group of its own (it
 # could not be stat()ed, or it is owned by group root), and keeps the values of
-# the hand-maintained specs these defaults were taken from: the V4L2 nodes
-# belong to the 'video' group (44) while the render, DMA heap and Hexagon DSP
-# nodes are handed to the container user's primary group (1000).
+# the hand-maintained specs these defaults were taken from: the V4L2 and camera
+# nodes belong to the 'video' group (44) while the render, DMA heap and Hexagon
+# DSP nodes are handed to the container user's primary group (1000). The
+# socket-only classes (audio, display) have no device node of their own; their
+# fallback applies to the group owning the socket they mount.
 DEFAULT_FILE_MODE = 0o660
 DEFAULT_UID = 0
 DEFAULT_GID = 1000
 CLASS_GID = {
     'gpu':          1000,
     'v4l2':         44,
+    'camera':       44,
+    'audio':        1000,
+    'display':      1000,
     'dmaheap':      1000,
     'fastrpc-cdsp': 1000,
     'fastrpc-adsp': 1000,
 }
 
 def node_gid_map(cdiclass: str, nodes: list[str] | None = None,
-                 gid: int | None = None) -> dict[str, int]:
+                 gid: int | None = None, what: str = "nodes") -> dict[str, int]:
     """Map each device node of one class to the group to grant for it.
 
     An explicit --gid always wins, for every node. Otherwise each node's group
@@ -87,6 +125,9 @@ def node_gid_map(cdiclass: str, nodes: list[str] | None = None,
     group root. A root-owned node is not honoured because the runtime drops a 0
     additionalGids entry, so a 0 here would grant an unprivileged container
     nothing.
+
+    what names the paths in the log lines; the socket-backed classes pass
+    'sockets' since they have no device node to speak of.
     """
     fallback = CLASS_GID.get(cdiclass, DEFAULT_GID)
     gidmap = {}
@@ -109,11 +150,11 @@ def node_gid_map(cdiclass: str, nodes: list[str] | None = None,
     for node, nodegid in gidmap.items():
         bygid.setdefault(nodegid, []).append(node)
     if len(bygid) > 1:
-        logging.info("Groups for '%s' nodes: %s", cdiclass,
-                     ", ".join("%d (%d node(s))" % (g, len(group))
+        logging.info("Groups for '%s' %s: %s", cdiclass, what,
+                     ", ".join("%d (%d path(s))" % (g, len(group))
                                for g, group in sorted(bygid.items())))
     elif bygid:
-        logging.info("Group for '%s' nodes: %d", cdiclass, next(iter(bygid)))
+        logging.info("Group for '%s' %s: %d", cdiclass, what, next(iter(bygid)))
     return gidmap
 
 def node_permissions(cdiclass: str, filemode: int | None = None,
@@ -200,8 +241,134 @@ def find_devicenodes(deviceglob: str) -> list[str]:
     logging.debug("Nodes for %s: %s", deviceglob, files)
     return files
 
+def devicenode_driver_module(node: str) -> str | None:
+    """Return the resolved sysfs driver module path backing a V4L2 node.
+
+    Mirrors the readlink in check-camx-overlay.sh as shipped on target:
+
+        readlink -f /sys/class/video4linux/$(basename $dev)/device/driver/module
+
+    None is returned when any link in that chain is missing, which is the
+    script's 2>/dev/null case: a node whose driver exposes no module (built-in
+    rather than a module) simply is not a camera by this test.
+    """
+    modulelink = Path('/sys/class/video4linux', Path(node).name,
+                      'device', 'driver', 'module')
+    try:
+        # resolve(strict=True) follows the whole chain like 'readlink -f' and
+        # raises if any component is missing, which is the script's
+        # 2>/dev/null case.
+        resolved = modulelink.resolve(strict=True)
+    except OSError as err:
+        logging.debug("No driver module for %s: %s", node, err)
+        return None
+    return str(resolved)
+
+def is_camera_devicenode(node: str) -> bool:
+    """Report whether one V4L2 node is backed by a camera driver.
+
+    This is the check from /usr/libexec/qmmf-server/check-camx-overlay.sh: the
+    node's driver module path is resolved through sysfs and matched against the
+    substring 'camera'. On a CamX target the camera nodes resolve to a module
+    whose name carries that keyword, while the video encode/decode nodes on the
+    same board do not, so this distinguishes a real camera from the rest of
+    /dev/video*.
+    """
+    module = devicenode_driver_module(node)
+    if module is None:
+        return False
+    iscamera = 'camera' in module
+    logging.debug("Driver module for %s: %s (camera: %s)", node, module, iscamera)
+    return iscamera
+
+def find_camera_devicenodes(videonodes: list[str]) -> list[str]:
+    """Select the camera nodes out of the probed V4L2 nodes.
+
+    Two filters apply, in this order:
+
+      * only /dev/video0..31 are considered (CAMERA_NODE_RANGE). The kernel
+        hands the low numbers to camera drivers and the high ones to the video
+        encode/decode devices.
+      * of those, only nodes whose driver module names a camera are kept, using
+        the same sysfs probe as check-camx-overlay.sh.
+
+    An empty list means no camera was detected, and the caller then writes no
+    camera spec at all rather than one pointing at nodes that are not cameras.
+    """
+    inrange = [node for node in videonodes
+               if get_devicenode_index(node) in CAMERA_NODE_RANGE]
+    logging.debug("V4L2 nodes in camera range %d-%d: %s",
+                  CAMERA_NODE_RANGE.start, CAMERA_NODE_RANGE.stop - 1, inrange)
+    cameras = [node for node in inrange if is_camera_devicenode(node)]
+    logging.info("Found %d camera node(s) of %d V4L2 node(s) in range",
+                 len(cameras), len(inrange))
+    return cameras
+
+def find_sockets(cdiclass: str) -> list[str]:
+    """Return the host sockets to mount for one class, keeping only those present.
+
+    A missing socket means the host-side server is not running, so there is
+    nothing for the container to connect to and the class is skipped. This is
+    the socket equivalent of an empty device node glob.
+    """
+    sockets = []
+    for path in CLASS_SOCKETS.get(cdiclass, []):
+        if Path(path).exists():
+            logging.info("Found %s socket: %s", cdiclass, path)
+            sockets.append(path)
+        else:
+            logging.debug("No %s socket at %s", cdiclass, path)
+    return sockets
+
+def generate_mounts_cdi(sockets: list[str]) -> list[dict]:
+    """Build the containerEdits mount entries for a list of host sockets.
+
+    Each socket is bind-mounted at the same path inside the container, so a
+    client using the conventional default (PULSE_SERVER, WAYLAND_DISPLAY) finds
+    it without extra configuration. The mounts are read-write because a unix
+    socket cannot be used by a client that may not write to it.
+    """
+    return [{"hostPath": socket, "containerPath": socket,
+             "options": list(SOCKET_MOUNT_OPTIONS)} for socket in sockets]
+
+def generate_sockets_cdi(nickname: str, sockets: list[str]) -> list[dict]:
+    """Build the CDI device entries for a socket-only class.
+
+    The audio and display classes pass through no device node at all, so their
+    device entry carries the socket mount rather than a deviceNodes list. The
+    container asks for qualcomm.com/audio=audio and gets the socket; without a
+    device entry the class could not be requested on the command line at all,
+    since a runtime only exposes named devices.
+
+    A single device named after the class is emitted, plus the ':all' catch-all
+    the other classes provide, so the two spellings behave the same everywhere.
+    """
+    if not sockets:
+        logging.debug("No sockets for '%s'; no CDI entries generated", nickname)
+        return []
+    logging.info("Generating CDI entries for '%s' with %d socket(s)",
+                 nickname, len(sockets))
+    mounts = generate_mounts_cdi(sockets)
+    return [{"name": nickname, "containerEdits": {"mounts": mounts}},
+            {"name": nickname + ":all", "containerEdits": {"mounts": mounts}}]
+
 def generate_devicenodes_cdi(nickname: str, filesglob: list[str],
-                             permissions: dict | Callable[[str], dict] | None = None) -> list[dict]:
+                             permissions: dict | Callable[[str], dict] | None = None,
+                             pernode: bool = True,
+                             catchall: bool = True) -> list[dict]:
+    """Build the CDI device entries for a list of device nodes.
+
+    nickname:    base name for the emitted devices, suffixed with the node index
+    filesglob:   the device nodes to expose
+    permissions: fileMode/uid/gid for the nodes; a dict shared by all of them, a
+                 callable asked per node, or None for the bare path-only form
+    pernode:     emit one device per node (renderD128, video0, ...)
+    catchall:    emit the '<nickname>:all' device covering every node at once
+
+    A class assembled from several globs calls this once per glob, with
+    catchall=False on all but one so the ':all' device is not defined twice, and
+    a final pernode=False call to emit a single catch-all spanning the lot.
+    """
     if filesglob:
         logging.info("Generating CDI entries for '%s' with %d node(s)", nickname, len(filesglob) if filesglob else 0)
         filesglob_set = set(filesglob)
@@ -245,7 +412,7 @@ def generate_devicenodes_cdi(nickname: str, filesglob: list[str],
 
         devicenodelist = []
         devicenodeindex = 0
-        for devicenode in sorted(filesglob):
+        for devicenode in sorted(filesglob) if pernode else []:
             if is_sibling(devicenode):
                 continue
             device_pathlist = { "deviceNodes": node_paths(devicenode) }
@@ -267,16 +434,17 @@ def generate_devicenodes_cdi(nickname: str, filesglob: list[str],
 
         # Build a catch-all entry that exposes every node in this class at once;
         # useful when a container needs the full set without listing them individually
-        device_paths = []
-        for devicenode in sorted(filesglob):
-            if is_sibling(devicenode):
-                continue
-            # Reuse the per-device logic so cdsp-secure/adsp-secure is also in :all
-            device_paths.extend(node_paths(devicenode))
-        device_pathlist = { "deviceNodes":  device_paths  }
-        device_entrys = { "name": nickname+":all", "containerEdits": device_pathlist }
-        logging.debug("CDI catch-all entry: %s", device_entrys)
-        devicenodelist.append(device_entrys)
+        if catchall:
+            device_paths = []
+            for devicenode in sorted(filesglob):
+                if is_sibling(devicenode):
+                    continue
+                # Reuse the per-device logic so cdsp-secure/adsp-secure is also in :all
+                device_paths.extend(node_paths(devicenode))
+            device_pathlist = { "deviceNodes":  device_paths  }
+            device_entrys = { "name": nickname+":all", "containerEdits": device_pathlist }
+            logging.debug("CDI catch-all entry: %s", device_entrys)
+            devicenodelist.append(device_entrys)
     else:
         devicenodelist = []
         logging.debug("No nodes found for '%s'; no CDI entries generated", nickname)
@@ -299,7 +467,9 @@ def build_cdi_spec(cdiclass: str, devices: list[dict],
     cdiclass:       device class name, suffixed onto CDI_VENDOR for the 'kind'
     devices:        list of CDI device entries (as built by generate_devicenodes_cdi)
     enventries:     list of "KEY=value" strings added to containerEdits.env
-    mountentries:   list of mount dicts; only attached for fastrpc classes
+    mountentries:   list of mount dicts attached to containerEdits.mounts; the
+                    caller decides what belongs to this class (DSP firmware for
+                    the fastrpc classes, a host socket for audio/camera/display)
     additionalgids: supplementary groups the container needs to open the nodes
 
     Access is expressed entirely through the spec: each deviceNodes entry
@@ -314,11 +484,10 @@ def build_cdi_spec(cdiclass: str, devices: list[dict],
     container_edits = {"env": enventries}
     if additionalgids:
         container_edits["additionalGids"] = additionalgids
-    # Only bind-mount DSP firmware and devicetree for fastrpc device classes,
-    # as those are the only classes that use Hexagon binaries
-    if "fastrpc" in cdiclass:
-        # filter(None, ...) strips any None placeholders left in the pre-allocated list
-        container_edits["mounts"] = list(filter(None, mountentries))
+    # filter(None, ...) strips any None placeholders left in a pre-allocated list
+    mounts = list(filter(None, mountentries or []))
+    if mounts:
+        container_edits["mounts"] = mounts
     cdi["containerEdits"] = container_edits
     return cdi
 
@@ -348,15 +517,21 @@ def main() -> int:
     cdifilename = args.cdifilename
 
     # Ownership/permissions applied to the generated device nodes. The group is
-    # resolved per node from the host nodes just probed, so every node keeps the
-    # group the device is actually handed to on this board unless it is
+    # resolved per path from the host paths just probed, so every node and
+    # socket keeps the group it is actually handed to on this board unless it is
     # overridden on the CLI. classgids collects the groups each class ended up
     # using, which become that spec's additionalGids.
     classgids = {}
 
-    def perms(cdiclass: str, nodes: list[str]) -> Callable[[str], dict]:
-        gidmap = node_gid_map(cdiclass, nodes, args.gid)
-        classgids[cdiclass] = sorted(set(gidmap.values()))
+    def resolve_gids(cdiclass: str, paths: list[str],
+                     what: str = "nodes") -> dict[str, int]:
+        """Resolve the group of every path of a class and record the union."""
+        gidmap = node_gid_map(cdiclass, paths, args.gid, what)
+        classgids.setdefault(cdiclass, set()).update(gidmap.values())
+        return gidmap
+
+    def perms_for(cdiclass: str, gidmap: dict[str, int]) -> Callable[[str], dict]:
+        """Per-node attribute callable backed by an already-resolved gid map."""
         fallback = CLASS_GID.get(cdiclass, DEFAULT_GID) if args.gid is None else args.gid
 
         def nodeperms(node: str) -> dict:
@@ -364,14 +539,60 @@ def main() -> int:
                                     gidmap.get(node, fallback))
         return nodeperms
 
-    # Find rendernodes and create entries for them
+    def perms(cdiclass: str, nodes: list[str]) -> Callable[[str], dict]:
+        """Resolve groups for a class's nodes and return its attribute callable."""
+        return perms_for(cdiclass, resolve_gids(cdiclass, nodes))
+
+    # Find the GPU nodes. The render node is the one a container renders
+    # through, but a full GPU stack also needs the DRM card node, and on a
+    # Qualcomm target the Adreno KGSL node when the kernel exposes one (older
+    # downstream kernels use /dev/kgsl-3d0 rather than going through DRM).
     rendernodes = find_devicenodes('/dev/dri/renderD*')
-    render_cdi = generate_devicenodes_cdi('renderD', rendernodes, perms('gpu', rendernodes))
+    cardnodes = find_devicenodes('/dev/dri/card*')
+    kgslnodes = find_devicenodes('/dev/kgsl-3d*')
+    gpunodes = rendernodes + cardnodes + kgslnodes
+    # One gid map for the whole class: the nodes often differ (a render node in
+    # 'render' next to a card node in 'video'), and additionalGids has to carry
+    # every one of those groups.
+    gpuperms = perms('gpu', gpunodes)
+    # Keep the established renderD* device names, and their renderD:all
+    # catch-all, so specs that already reference them keep working. The card
+    # and KGSL nodes are added alongside under their own names, plus a single
+    # 'gpu:all' that hands over the whole GPU stack at once.
+    render_cdi = generate_devicenodes_cdi('renderD', rendernodes, gpuperms)
+    card_cdi = generate_devicenodes_cdi('card', cardnodes, gpuperms, catchall=False)
+    kgsl_cdi = generate_devicenodes_cdi('kgsl-3d', kgslnodes, gpuperms, catchall=False)
+    gpu_all_cdi = generate_devicenodes_cdi('gpu', gpunodes, gpuperms, pernode=False)
+    gpu_cdi = render_cdi + card_cdi + kgsl_cdi + gpu_all_cdi
 
     # Find all videonoodes and generate entries
-    # TODO: add input/output filters to make selecting between encoders, decoders and cameras easier
+    # The v4l2 class carries every node, encoders and decoders included; the
+    # camera class below narrows this down to the nodes a camera driver owns.
     videonodes = find_devicenodes('/dev/video*')
     video_cdi = generate_devicenodes_cdi('video', videonodes, perms('v4l2', videonodes))
+
+    # Narrow the V4L2 nodes down to the cameras, using the same sysfs driver
+    # probe as check-camx-overlay.sh on target. The camera server socket is
+    # mounted alongside them: a client talks to qmmf/CamX over that socket, so
+    # the nodes alone are not enough to use the camera.
+    cameranodes = find_camera_devicenodes(videonodes)
+    camerasockets = find_sockets('camera')
+    cameraperms = perms_for('camera', resolve_gids(
+        'camera', cameranodes + camerasockets, "nodes and sockets"))
+    camera_cdi = generate_devicenodes_cdi('camera', cameranodes, cameraperms)
+    camera_mounts = generate_mounts_cdi(camerasockets)
+
+    # Socket-only classes. There is no device node to pass through: the
+    # container reaches the host audio server and compositor over a unix
+    # socket, so the bind-mounted socket is the whole device and it rides on
+    # the device entry itself.
+    audiosockets = find_sockets('audio')
+    resolve_gids('audio', audiosockets, "sockets")
+    audio_cdi = generate_sockets_cdi('audio', audiosockets)
+
+    displaysockets = find_sockets('display')
+    resolve_gids('display', displaysockets, "sockets")
+    display_cdi = generate_sockets_cdi('display', displaysockets)
 
     # Check for DMA heap
     dmaheaps = find_devicenodes('/dev/dma_heap/*system')
@@ -420,15 +641,22 @@ def main() -> int:
     if dtmodelstring is not None:
         enventries = [ "MACHINE_NAME=" + dtmodelstring ]
 
-    # Write one CDI json per device class
+    # Write one CDI json per device class, each with the mounts that class
+    # needs: the Hexagon binaries and devicetree model for the fastrpc classes,
+    # the camera server socket for the camera class, and nothing for the rest.
+    # The audio and display sockets ride on their device entries instead, so
+    # requesting the device is what mounts the socket.
     cdi_sections = [
-        ('gpu',          render_cdi),
-        ('v4l2',         video_cdi),
-        ('dmaheap',      dmaheap_cdi),
-        ('fastrpc-cdsp', cdsps_cdi),
-        ('fastrpc-adsp', adsps_cdi),
+        ('gpu',          gpu_cdi,     []),
+        ('v4l2',         video_cdi,   []),
+        ('camera',       camera_cdi,  camera_mounts),
+        ('audio',        audio_cdi,   []),
+        ('display',      display_cdi, []),
+        ('dmaheap',      dmaheap_cdi, []),
+        ('fastrpc-cdsp', cdsps_cdi,   mountentries),
+        ('fastrpc-adsp', adsps_cdi,   mountentries),
     ]
-    cdi_sections = [(c, d) for c, d in cdi_sections if c in enabled_classes]
+    cdi_sections = [(c, d, m) for c, d, m in cdi_sections if c in enabled_classes]
     dynamiccdidir = Path(destdir).joinpath('run/cdi')
     cdifilename_stem = Path(cdifilename).stem
     cdifilename_suffix = Path(cdifilename).suffix
@@ -445,12 +673,12 @@ def main() -> int:
             logging.warning("Old style monolithic CDI detected, removing %s", legacy_cdi)
             legacy_cdi.unlink()
 
-    for cdiclass, devices in cdi_sections:
+    for cdiclass, devices, classmounts in cdi_sections:
         if not devices:
             logging.debug("Skipping CDI file for '%s': no devices", cdiclass)
             continue
-        cdi = build_cdi_spec(cdiclass, devices, enventries, mountentries,
-                             node_additional_gids(cdiclass, classgids.get(cdiclass)))
+        cdi = build_cdi_spec(cdiclass, devices, enventries, classmounts,
+                             node_additional_gids(cdiclass, sorted(classgids.get(cdiclass, ()))))
         section_filename = "%s-%s%s" % (cdifilename_stem, cdiclass, cdifilename_suffix)
         cdipath = dynamiccdidir.joinpath(section_filename)
         if args.dry_run:

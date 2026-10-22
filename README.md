@@ -91,12 +91,94 @@ The tool probes the hardware and writes one CDI JSON file per device class under
 |--------|-----------|---------|-------------|
 | `-d` | `--destdir` | `/` | Root directory for all output paths |
 | `-c` | `--cdifilename` | `qualcomm.json` | CDI filename base; the device class is inserted before the extension, e.g. `qualcomm.json` → `qualcomm-gpu.json` |
-| `-C` | `--classes` | all | Comma-separated list of CDI classes to generate. Available: `gpu`, `v4l2`, `dmaheap`, `fastrpc-cdsp`, `fastrpc-adsp` |
+| `-C` | `--classes` | all | Comma-separated list of CDI classes to generate. Available: `gpu`, `v4l2`, `camera`, `audio`, `display`, `dmaheap`, `fastrpc-cdsp`, `fastrpc-adsp` |
 | `-m` | `--filemode` | `0660` | `fileMode` for generated device nodes, parsed as octal |
 | `-u` | `--uid` | `0` | `uid` for generated device nodes |
 | `-g` | `--gid` | from host nodes | `gid` for generated device nodes and `additionalGids`, overriding the group read from each host device node |
 | `-n` | `--dry-run` | off | Probe devices but do not write any files |
 | `-v` | `--verbose` | off | Increase verbosity; use `-vv` for debug output |
+
+### Device classes
+
+Each class becomes one CDI file and is written only when the hardware or
+host-side server it describes is actually present:
+
+| Class | Device nodes | Mounts |
+|-------|--------------|--------|
+| `gpu` | `/dev/dri/renderD*`, `/dev/dri/card*`, `/dev/kgsl-3d*` | — |
+| `v4l2` | `/dev/video*` (all of them) | — |
+| `camera` | the `/dev/video0`–`31` nodes a camera driver owns | `/run/cam_server/le_camera_socket` |
+| `audio` | — | `/run/user/1000/pulse/native` |
+| `display` | — | `/run/user/1000/wayland-0` |
+| `dmaheap` | `/dev/dma_heap/*system` | — |
+| `fastrpc-cdsp` | `/dev/fastrpc-cdsp*` | DSP firmware, devicetree model |
+| `fastrpc-adsp` | `/dev/fastrpc-adsp*` | DSP firmware, devicetree model |
+
+#### GPU nodes
+
+The `gpu` class exposes the render node a container draws through, the DRM card
+node, and the Adreno KGSL node when the kernel provides one — some downstream
+kernels expose `/dev/kgsl-3d0` instead of routing everything through DRM. A
+board without it simply gets the render and card nodes.
+
+Each node is available under its own device name, and `gpu:all` hands over the
+whole stack at once. The historical `renderD128` / `renderD:all` names are kept
+unchanged, so specs and scripts that already reference them keep working:
+
+```shell
+# docker run --device qualcomm.com/gpu=gpu:all --rm -it mycontainer
+```
+
+Note that the GPU nodes frequently span two groups — the render node belongs to
+`render` while the card node belongs to `video` — which is handled per node; see
+[Device node ownership and permissions](#device-node-ownership-and-permissions).
+
+#### Camera detection
+
+`v4l2` exposes every `/dev/video*` node, encoders and decoders included. The
+`camera` class narrows that down to the nodes a camera driver actually owns,
+using the same probe as `/usr/libexec/qmmf-server/check-camx-overlay.sh` on
+target: each node's driver module is resolved through sysfs
+
+```
+/sys/class/video4linux/<node>/device/driver/module
+```
+
+and kept when the resolved module path contains `camera`. Only `/dev/video0`
+through `/dev/video31` are considered, since the kernel hands the low numbers to
+camera drivers and the high ones to the video encode/decode devices.
+
+If no camera driver is bound, no `camera` spec is written at all — the class is
+absent rather than pointing at nodes that are not cameras. A node whose driver
+exposes no module is not a camera by this test, matching the script's behaviour.
+
+#### Socket-backed classes
+
+`audio` and `display` pass through no device node. The container talks to the
+host PulseAudio server and Wayland compositor over a unix socket, so the socket
+*is* the device and the spec carries a bind-mount instead of a `deviceNodes`
+entry. `camera` needs both: the V4L2 nodes and the camera server socket, since a
+client reaches qmmf/CamX through the latter.
+
+Each socket is mounted at the same path inside the container, so the usual
+client defaults (`PULSE_SERVER`, `WAYLAND_DISPLAY`, `XDG_RUNTIME_DIR`) resolve
+unchanged. The mounts are read-write — a socket is useless to a client that
+cannot write to it — and `nosuid,noexec`.
+
+A class whose socket is missing is skipped, exactly as a class whose device
+nodes are missing is: the host-side server is not running, so the spec would
+hand the container a path it cannot connect to. The socket's owning group is
+read and granted the same way a device node's is, since the container has to be
+in that group to connect.
+
+```shell
+# docker run --device qualcomm.com/audio=audio --device qualcomm.com/display=display \
+      --rm -it mycontainer
+```
+
+> **Note:** the socket paths are the server-side defaults for user 1000. A
+> target running the audio server or compositor under a different user needs
+> those paths adjusted (`CLASS_SOCKETS` in the generator).
 
 ### Device node ownership and permissions
 
@@ -152,9 +234,15 @@ so honouring it would grant an unprivileged container nothing):
 |-------|----------------|-----------|
 | `gpu` | 1000 | render node handed to the container user's primary group |
 | `v4l2` | 44 | V4L2 nodes conventionally belong to the `video` group |
+| `camera` | 44 | camera nodes are V4L2 nodes, in the same `video` group |
+| `audio` | 1000 | audio socket in the user runtime dir, owned by that user's group |
+| `display` | 1000 | Wayland socket in the user runtime dir, likewise |
 | `dmaheap` | 1000 | DMA heap handed to the container user's primary group |
 | `fastrpc-cdsp` | 1000 | Hexagon DSP node handed to the container user's primary group |
 | `fastrpc-adsp` | 1000 | Hexagon DSP node handed to the container user's primary group |
+
+For the socket-backed classes the group is read from the socket rather than a
+device node; everything else about the resolution is identical.
 
 Nodes are exposed root-owned and group accessible (`0660`, `uid` 0). Override
 any of that for all classes at once:
@@ -180,11 +268,26 @@ INFO: Starting Qualcomm CDI generation
 INFO: Config: destdir=/, cdifilename=qualcomm.json, dry_run=False
 INFO: Node attributes: fileMode=0o660 (default), uid=0 (default), gid=from host device nodes
 INFO: Found 1 nodes for pattern /dev/dri/renderD*
-INFO: Group for 'gpu' nodes: 1000
+INFO: Found 1 nodes for pattern /dev/dri/card*
+INFO: Found 1 nodes for pattern /dev/kgsl-3d*
+INFO: Groups for 'gpu' nodes: 44 (1 path(s)), 110 (2 path(s))
 INFO: Generating CDI entries for 'renderD' with 1 node(s)
+INFO: Generating CDI entries for 'card' with 1 node(s)
+INFO: Generating CDI entries for 'kgsl-3d' with 1 node(s)
+INFO: Generating CDI entries for 'gpu' with 3 node(s)
 INFO: Found 30 nodes for pattern /dev/video*
 INFO: Group for 'v4l2' nodes: 44
 INFO: Generating CDI entries for 'video' with 30 node(s)
+INFO: Found 2 camera node(s) of 30 V4L2 node(s) in range
+INFO: Found camera socket: /run/cam_server/le_camera_socket
+INFO: Groups for 'camera' nodes and sockets: 44 (2 path(s)), 1002 (1 path(s))
+INFO: Generating CDI entries for 'camera' with 2 node(s)
+INFO: Found audio socket: /run/user/1000/pulse/native
+INFO: Group for 'audio' sockets: 29
+INFO: Generating CDI entries for 'audio' with 1 socket(s)
+INFO: Found display socket: /run/user/1000/wayland-0
+INFO: Group for 'display' sockets: 1000
+INFO: Generating CDI entries for 'display' with 1 socket(s)
 INFO: Found 1 nodes for pattern /dev/dma_heap/*system
 INFO: Group for 'dmaheap' nodes: 1000
 INFO: Generating CDI entries for 'dmaheap-system' with 1 node(s)
@@ -199,6 +302,9 @@ INFO: Found 14 nodes for pattern /usr/share/*/*/*/*/dsp/
 WARNING: Old style monolithic CDI detected, removing /run/cdi/qualcomm.json
 INFO: Wrote CDI JSON: /run/cdi/qualcomm-gpu.json
 INFO: Wrote CDI JSON: /run/cdi/qualcomm-v4l2.json
+INFO: Wrote CDI JSON: /run/cdi/qualcomm-camera.json
+INFO: Wrote CDI JSON: /run/cdi/qualcomm-audio.json
+INFO: Wrote CDI JSON: /run/cdi/qualcomm-display.json
 INFO: Wrote CDI JSON: /run/cdi/qualcomm-dmaheap.json
 INFO: Wrote CDI JSON: /run/cdi/qualcomm-fastrpc-cdsp.json
 INFO: Wrote CDI JSON: /run/cdi/qualcomm-fastrpc-adsp.json
@@ -210,12 +316,22 @@ Server:
   /etc/cdi
   /var/run/cdi
  Discovered Devices:
+  cdi: qualcomm.com/audio=audio
+  cdi: qualcomm.com/audio=audio:all
+  cdi: qualcomm.com/camera=camera0
+  cdi: qualcomm.com/camera=camera1
+  cdi: qualcomm.com/camera=camera:all
+  cdi: qualcomm.com/display=display
+  cdi: qualcomm.com/display=display:all
   cdi: qualcomm.com/dmaheap=dmaheap-system
   cdi: qualcomm.com/dmaheap=dmaheap-system:all
   cdi: qualcomm.com/fastrpc-adsp=fastrpc-adsp
   cdi: qualcomm.com/fastrpc-adsp=fastrpc-adsp:all
   cdi: qualcomm.com/fastrpc-cdsp=fastrpc-cdsp
   cdi: qualcomm.com/fastrpc-cdsp=fastrpc-cdsp:all
+  cdi: qualcomm.com/gpu=card0
+  cdi: qualcomm.com/gpu=gpu:all
+  cdi: qualcomm.com/gpu=kgsl-3d0
   cdi: qualcomm.com/gpu=renderD128
   cdi: qualcomm.com/gpu=renderD:all
   cdi: qualcomm.com/v4l2=video0
@@ -252,52 +368,65 @@ Server:
 [...]
 (cdi) root@ventunoq:~# cdi classes
 CDI device classes found:
-  0. dmaheap (1 vendors: qualcomm.com)
-  1. fastrpc-adsp (1 vendors: qualcomm.com)
-  2. fastrpc-cdsp (1 vendors: qualcomm.com)
-  3. gpu (1 vendors: qualcomm.com)
-  4. v4l2 (1 vendors: qualcomm.com)
+  0. audio (1 vendors: qualcomm.com)
+  1. camera (1 vendors: qualcomm.com)
+  2. display (1 vendors: qualcomm.com)
+  3. dmaheap (1 vendors: qualcomm.com)
+  4. fastrpc-adsp (1 vendors: qualcomm.com)
+  5. fastrpc-cdsp (1 vendors: qualcomm.com)
+  6. gpu (1 vendors: qualcomm.com)
+  7. v4l2 (1 vendors: qualcomm.com)
 (cdi) root@ventunoq:~# cdi devices
 CDI devices found:
-  0. qualcomm.com/dmaheap=dmaheap-system
-  1. qualcomm.com/dmaheap=dmaheap-system:all
-  2. qualcomm.com/fastrpc-adsp=fastrpc-adsp
-  3. qualcomm.com/fastrpc-adsp=fastrpc-adsp:all
-  4. qualcomm.com/fastrpc-cdsp=fastrpc-cdsp
-  5. qualcomm.com/fastrpc-cdsp=fastrpc-cdsp:all
-  6. qualcomm.com/gpu=renderD128
-  7. qualcomm.com/gpu=renderD:all
-  8. qualcomm.com/v4l2=video0
-  9. qualcomm.com/v4l2=video1
-  10. qualcomm.com/v4l2=video10
-  11. qualcomm.com/v4l2=video11
-  12. qualcomm.com/v4l2=video12
-  13. qualcomm.com/v4l2=video13
-  14. qualcomm.com/v4l2=video14
-  15. qualcomm.com/v4l2=video15
-  16. qualcomm.com/v4l2=video16
-  17. qualcomm.com/v4l2=video17
-  18. qualcomm.com/v4l2=video18
-  19. qualcomm.com/v4l2=video19
-  20. qualcomm.com/v4l2=video2
-  21. qualcomm.com/v4l2=video20
-  22. qualcomm.com/v4l2=video21
-  23. qualcomm.com/v4l2=video22
-  24. qualcomm.com/v4l2=video23
-  25. qualcomm.com/v4l2=video24
-  26. qualcomm.com/v4l2=video25
-  27. qualcomm.com/v4l2=video26
-  28. qualcomm.com/v4l2=video27
-  29. qualcomm.com/v4l2=video28
-  30. qualcomm.com/v4l2=video29
-  31. qualcomm.com/v4l2=video3
-  32. qualcomm.com/v4l2=video4
-  33. qualcomm.com/v4l2=video5
-  34. qualcomm.com/v4l2=video6
-  35. qualcomm.com/v4l2=video7
-  36. qualcomm.com/v4l2=video8
-  37. qualcomm.com/v4l2=video9
-  38. qualcomm.com/v4l2=video:all
+  0. qualcomm.com/audio=audio
+  1. qualcomm.com/audio=audio:all
+  2. qualcomm.com/camera=camera0
+  3. qualcomm.com/camera=camera1
+  4. qualcomm.com/camera=camera:all
+  5. qualcomm.com/display=display
+  6. qualcomm.com/display=display:all
+  7. qualcomm.com/dmaheap=dmaheap-system
+  8. qualcomm.com/dmaheap=dmaheap-system:all
+  9. qualcomm.com/fastrpc-adsp=fastrpc-adsp
+  10. qualcomm.com/fastrpc-adsp=fastrpc-adsp:all
+  11. qualcomm.com/fastrpc-cdsp=fastrpc-cdsp
+  12. qualcomm.com/fastrpc-cdsp=fastrpc-cdsp:all
+  13. qualcomm.com/gpu=card0
+  14. qualcomm.com/gpu=gpu:all
+  15. qualcomm.com/gpu=kgsl-3d0
+  16. qualcomm.com/gpu=renderD128
+  17. qualcomm.com/gpu=renderD:all
+  18. qualcomm.com/v4l2=video0
+  19. qualcomm.com/v4l2=video1
+  20. qualcomm.com/v4l2=video10
+  21. qualcomm.com/v4l2=video11
+  22. qualcomm.com/v4l2=video12
+  23. qualcomm.com/v4l2=video13
+  24. qualcomm.com/v4l2=video14
+  25. qualcomm.com/v4l2=video15
+  26. qualcomm.com/v4l2=video16
+  27. qualcomm.com/v4l2=video17
+  28. qualcomm.com/v4l2=video18
+  29. qualcomm.com/v4l2=video19
+  30. qualcomm.com/v4l2=video2
+  31. qualcomm.com/v4l2=video20
+  32. qualcomm.com/v4l2=video21
+  33. qualcomm.com/v4l2=video22
+  34. qualcomm.com/v4l2=video23
+  35. qualcomm.com/v4l2=video24
+  36. qualcomm.com/v4l2=video25
+  37. qualcomm.com/v4l2=video26
+  38. qualcomm.com/v4l2=video27
+  39. qualcomm.com/v4l2=video28
+  40. qualcomm.com/v4l2=video29
+  41. qualcomm.com/v4l2=video3
+  42. qualcomm.com/v4l2=video4
+  43. qualcomm.com/v4l2=video5
+  44. qualcomm.com/v4l2=video6
+  45. qualcomm.com/v4l2=video7
+  46. qualcomm.com/v4l2=video8
+  47. qualcomm.com/v4l2=video9
+  48. qualcomm.com/v4l2=video:all
 ```
 
 You can then pass one or more of the above entries to the runtime:
@@ -318,11 +447,26 @@ INFO: Starting Qualcomm CDI generation
 INFO: Config: destdir=/, cdifilename=qualcomm.json, dry_run=False
 INFO: Node attributes: fileMode=0o660 (default), uid=0 (default), gid=from host device nodes
 INFO: Found 1 nodes for pattern /dev/dri/renderD*
-INFO: Group for 'gpu' nodes: 1000
+INFO: Found 1 nodes for pattern /dev/dri/card*
+INFO: Found 1 nodes for pattern /dev/kgsl-3d*
+INFO: Groups for 'gpu' nodes: 44 (1 path(s)), 110 (2 path(s))
 INFO: Generating CDI entries for 'renderD' with 1 node(s)
+INFO: Generating CDI entries for 'card' with 1 node(s)
+INFO: Generating CDI entries for 'kgsl-3d' with 1 node(s)
+INFO: Generating CDI entries for 'gpu' with 3 node(s)
 INFO: Found 30 nodes for pattern /dev/video*
 INFO: Group for 'v4l2' nodes: 44
 INFO: Generating CDI entries for 'video' with 30 node(s)
+INFO: Found 2 camera node(s) of 30 V4L2 node(s) in range
+INFO: Found camera socket: /run/cam_server/le_camera_socket
+INFO: Groups for 'camera' nodes and sockets: 44 (2 path(s)), 1002 (1 path(s))
+INFO: Generating CDI entries for 'camera' with 2 node(s)
+INFO: Found audio socket: /run/user/1000/pulse/native
+INFO: Group for 'audio' sockets: 29
+INFO: Generating CDI entries for 'audio' with 1 socket(s)
+INFO: Found display socket: /run/user/1000/wayland-0
+INFO: Group for 'display' sockets: 1000
+INFO: Generating CDI entries for 'display' with 1 socket(s)
 INFO: Found 1 nodes for pattern /dev/dma_heap/*system
 INFO: Group for 'dmaheap' nodes: 1000
 INFO: Generating CDI entries for 'dmaheap-system' with 1 node(s)
@@ -339,15 +483,20 @@ INFO: Wrote CDI JSON: /run/cdi/qualcomm-fastrpc-adsp.json
 INFO: Completed Qualcomm CDI generation
 ```
 
+Note that every class is still probed; `--classes` selects which CDI files are
+written, not what the generator looks at.
+
 ### CDI file structure
 
-The tool writes one JSON file per device class. Each file has a `kind` matching its class (e.g. `qualcomm.com/gpu`). Every `deviceNodes` entry carries `fileMode`, `uid` and the `gid` read from that host device node, and the spec-level `containerEdits` sets `additionalGids` to every group those nodes use (see [Device node ownership and permissions](#device-node-ownership-and-permissions)). The `fastrpc` files additionally include bind-mounts for Hexagon DSP firmware found under `/usr/share/*/*/*/*/dsp/` and the devicetree model string, since those binaries are tightly coupled to the in-kernel firmware loader.
+The tool writes one JSON file per device class (see [Device
+classes](#device-classes)). Each file has a `kind` matching its class (e.g. `qualcomm.com/gpu`). Every `deviceNodes` entry carries `fileMode`, `uid` and the `gid` read from that host device node, and the spec-level `containerEdits` sets `additionalGids` to every group those nodes use (see [Device node ownership and permissions](#device-node-ownership-and-permissions)). The `fastrpc` files additionally include bind-mounts for Hexagon DSP firmware found under `/usr/share/*/*/*/*/dsp/` and the devicetree model string, since those binaries are tightly coupled to the in-kernel firmware loader, and the `camera` file mounts the camera server socket.
 
 The specs declare `cdiVersion` `0.7.0`, the first CDI version that defines
 `additionalGids`; see [Minimum runtime versions](#minimum-runtime-versions) for
 the runtime releases that accept it.
 
-Example `qualcomm-gpu.json`:
+Example `qualcomm-gpu.json`, on a board whose render node is in `render` (110)
+and card node in `video` (44):
 ```json
 {
   "cdiVersion": "0.7.0",
@@ -357,7 +506,7 @@ Example `qualcomm-gpu.json`:
       "name": "renderD128",
       "containerEdits": {
         "deviceNodes": [
-          { "path": "/dev/dri/renderD128", "fileMode": 432, "uid": 0, "gid": 1000 }
+          { "path": "/dev/dri/renderD128", "fileMode": 432, "uid": 0, "gid": 110 }
         ]
       }
     },
@@ -365,7 +514,54 @@ Example `qualcomm-gpu.json`:
       "name": "renderD:all",
       "containerEdits": {
         "deviceNodes": [
-          { "path": "/dev/dri/renderD128", "fileMode": 432, "uid": 0, "gid": 1000 }
+          { "path": "/dev/dri/renderD128", "fileMode": 432, "uid": 0, "gid": 110 }
+        ]
+      }
+    },
+    {
+      "name": "card0",
+      "containerEdits": {
+        "deviceNodes": [
+          { "path": "/dev/dri/card0", "fileMode": 432, "uid": 0, "gid": 44 }
+        ]
+      }
+    },
+    {
+      "name": "gpu:all",
+      "containerEdits": {
+        "deviceNodes": [
+          { "path": "/dev/dri/card0", "fileMode": 432, "uid": 0, "gid": 44 },
+          { "path": "/dev/dri/renderD128", "fileMode": 432, "uid": 0, "gid": 110 }
+        ]
+      }
+    }
+  ],
+  "containerEdits": {
+    "env": [ "MACHINE_NAME=Qualcomm Technologies, Inc. Robotics RB3gen2" ],
+    "additionalGids": [ 44, 110 ]
+  }
+}
+```
+
+A `/dev/kgsl-3d0` node, where present, appears alongside `card0` under its own
+`kgsl-3d0` name and in `gpu:all`.
+
+Example `qualcomm-audio.json`, where the socket mount rides on the device entry
+so that requesting the device is what mounts the socket:
+```json
+{
+  "cdiVersion": "0.7.0",
+  "kind": "qualcomm.com/audio",
+  "devices": [
+    {
+      "name": "audio",
+      "containerEdits": {
+        "mounts": [
+          {
+            "hostPath": "/run/user/1000/pulse/native",
+            "containerPath": "/run/user/1000/pulse/native",
+            "options": [ "nosuid", "noexec", "rw", "bind" ]
+          }
         ]
       }
     }
@@ -376,6 +572,9 @@ Example `qualcomm-gpu.json`:
   }
 }
 ```
+
+The `audio:all` entry is omitted above for brevity; it carries the same mount,
+so both spellings behave alike.
 
 `fileMode` is `432`, the decimal form of octal `0660`.
 

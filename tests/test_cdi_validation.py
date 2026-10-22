@@ -72,6 +72,8 @@ CDI_TOOL = _find_cdi_tool()
 # main() deterministically regardless of the hardware the tests run on.
 FAKE_NODES = {
     "/dev/dri/renderD*": ["/dev/dri/renderD128"],
+    "/dev/dri/card*": ["/dev/dri/card0"],
+    "/dev/kgsl-3d*": ["/dev/kgsl-3d0"],
     "/dev/video*": ["/dev/video0", "/dev/video1"],
     "/dev/dma_heap/*system": ["/dev/dma_heap/system"],
     "/dev/fastrpc-cdsp*": ["/dev/fastrpc-cdsp", "/dev/fastrpc-cdsp-secure"],
@@ -79,8 +81,16 @@ FAKE_NODES = {
     "/usr/share/*/*/*/*/dsp/": [],
 }
 
+# Host sockets the socket-backed classes look for. Keyed by class so a test can
+# present or withhold each one; withheld means the server is not running.
+FAKE_SOCKETS = {
+    "audio": "/run/user/1000/pulse/native",
+    "camera": "/run/cam_server/le_camera_socket",
+    "display": "/run/user/1000/wayland-0",
+}
 
-def fake_stat(gids, fake_nodes=FAKE_NODES):
+
+def fake_stat(gids, fake_nodes=FAKE_NODES, sockets=()):
     """Return an os.stat replacement reporting controlled device node groups.
 
     The generator reads the owning group of the nodes it probes, and some of
@@ -89,13 +99,15 @@ def fake_stat(gids, fake_nodes=FAKE_NODES):
     node list from a fixed mapping instead, so the resolved group is the one the
     test asked for rather than the test machine's.
 
-    gids maps a node path to the gid to report; any other synthetic node raises
-    OSError as if it were absent, which is what the generator sees on a host
-    where the class has no nodes. Every unrelated path (the temporary output
-    directory, anything pathlib stats internally) goes to the real os.stat.
+    gids maps a node path to the gid to report; any other synthetic node or
+    socket raises OSError as if it were absent, which is what the generator sees
+    on a host where the class has no nodes. Every unrelated path (the temporary
+    output directory, anything pathlib stats internally) goes to the real
+    os.stat.
     """
     real_stat = os.stat
     synthetic = {node for nodes in fake_nodes.values() for node in nodes}
+    synthetic.update(sockets)
 
     def stat(path, *args, **kwargs):
         key = os.fspath(path) if isinstance(path, (str, os.PathLike)) else path
@@ -120,14 +132,23 @@ ALL_NODES_GID = 110
 ALL_NODES_STAT = fake_stat_all(ALL_NODES_GID)
 
 
-def run_generator(extra_argv, fake_nodes=FAKE_NODES, node_gids=None):
+def run_generator(extra_argv, fake_nodes=FAKE_NODES, node_gids=None,
+                  sockets=(), cameras=()):
     """Run main() with synthetic device discovery into a fresh argv.
 
     find_devicenodes is replaced with controlled node lists and the direct
     glob.glob() devicetree probe is stubbed empty, so the run does not depend
     on the host hardware. node_gids maps node paths to the group to report for
     them; nodes left out of it stat as absent, so the generator falls back to
-    its per-class default group. Returns main()'s exit code.
+    its per-class default group.
+
+    sockets lists the host sockets that exist for this run (paths, as in
+    FAKE_SOCKETS.values()); any socket not listed is reported absent, which is
+    what the generator sees when the host-side server is not running. cameras
+    lists the /dev/video* nodes whose driver module names a camera, standing in
+    for the sysfs probe that check-camx-overlay.sh performs on target.
+
+    Returns main()'s exit code.
     """
     real_find = gen.find_devicenodes
 
@@ -144,10 +165,20 @@ def run_generator(extra_argv, fake_nodes=FAKE_NODES, node_gids=None):
             return []
         return real_glob(pattern, *args, **kwargs)
 
+    socketset = set(sockets)
+
+    def fake_find_sockets(cdiclass):
+        return [path for path in gen.CLASS_SOCKETS.get(cdiclass, [])
+                if path in socketset]
+
+    cameraset = set(cameras)
+
     with mock.patch.object(gen, "find_devicenodes", fake_find), \
             mock.patch.object(gen.glob, "glob", fake_glob), \
+            mock.patch.object(gen, "find_sockets", fake_find_sockets), \
+            mock.patch.object(gen, "is_camera_devicenode", cameraset.__contains__), \
             mock.patch.object(gen.os, "stat",
-                              fake_stat(node_gids or {}, fake_nodes)), \
+                              fake_stat(node_gids or {}, fake_nodes, socketset)), \
             mock.patch.object(sys, "argv", ["qualcomm-cdi-generator.py"] + extra_argv):
         # main() calls setup_logging(), which would print the generator's log
         # lines to the test console; keep the suite output clean by muting it.
@@ -269,12 +300,19 @@ class StructuralTests(unittest.TestCase):
         self.assertGreaterEqual(
             tuple(int(p) for p in gen.CDI_VERSION.split(".")), (0, 7, 0))
 
-    def test_mounts_only_for_fastrpc(self):
+    def test_mounts_attached_when_given(self):
+        # build_cdi_spec attaches whatever mounts the caller passes; main()
+        # decides what belongs to each class (DSP firmware for fastrpc, the
+        # camera socket for camera, nothing for the rest).
         mounts = [{"hostPath": "/x", "containerPath": "/x", "options": ["ro", "bind"]}]
-        gpu = gen.build_cdi_spec("gpu", [], [], mounts)
-        self.assertNotIn("mounts", gpu["containerEdits"])
         cdsp = gen.build_cdi_spec("fastrpc-cdsp", [], [], mounts)
         self.assertEqual(cdsp["containerEdits"]["mounts"], mounts)
+
+    def test_mounts_omitted_when_empty(self):
+        # A class with no mounts must not leave a bare "mounts": [] behind.
+        for mounts in ([], None, [None]):
+            spec = gen.build_cdi_spec("gpu", [], [], mounts)
+            self.assertNotIn("mounts", spec["containerEdits"], repr(mounts))
 
     def test_mount_none_placeholders_filtered(self):
         # main() pre-allocates the mount list with None placeholders; build_cdi_spec
@@ -442,10 +480,12 @@ class StructuralTests(unittest.TestCase):
 
     def test_host_node_group_is_per_class(self):
         # Each class resolves its own group, so a board that puts the V4L2
-        # nodes in 'video' and the render node in 'render' gets both.
+        # nodes in 'video' and the GPU nodes in 'render' gets both.
         with tempfile.TemporaryDirectory() as d:
             rc = run_generator(["-d", d], node_gids={
                 "/dev/dri/renderD128": 110,
+                "/dev/dri/card0": 110,
+                "/dev/kgsl-3d0": 110,
                 "/dev/video0": 44,
                 "/dev/video1": 44,
             })
@@ -605,6 +645,285 @@ class StructuralTests(unittest.TestCase):
             self.assertEqual(written, ["qualcomm-fastrpc-cdsp.json"])
 
 
+class CameraDetectionTests(unittest.TestCase):
+    """Tests for the sysfs camera probe ported from check-camx-overlay.sh."""
+
+    def _sysfs(self, modules):
+        """Build a sysfs-shaped tree: {node name: driver module dir or None}.
+
+        Mirrors the layout the on-target script walks:
+            /sys/class/video4linux/<node>/device/driver/module -> <module dir>
+        A None module leaves the chain broken at 'driver', standing in for a
+        built-in driver that exposes no module.
+        """
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        v4l = root / "sys" / "class" / "video4linux"
+        for node, module in modules.items():
+            driver = v4l / node / "device" / "driver"
+            driver.mkdir(parents=True)
+            if module is not None:
+                modpath = root / "sys" / "module" / module
+                modpath.mkdir(parents=True, exist_ok=True)
+                (driver / "module").symlink_to(modpath)
+        return root, v4l
+
+    def _patched_probe(self, v4l, node):
+        """Run is_camera_devicenode() against a synthetic sysfs root."""
+        realpath = gen.Path
+
+        class FakePath(type(realpath())):
+            # Redirect only the one sysfs path the probe builds; everything
+            # else (including Path(node).name) behaves normally.
+            def __new__(cls, *args):
+                if args and str(args[0]) == "/sys/class/video4linux":
+                    return realpath(v4l, *args[1:])
+                return realpath(*args)
+
+        with mock.patch.object(gen, "Path", FakePath):
+            return gen.is_camera_devicenode(node)
+
+    def test_camera_module_detected(self):
+        # A driver module whose name carries 'camera' marks the node a camera,
+        # which is exactly the substring test the shell script performs.
+        root, v4l = self._sysfs({"video0": "qcom_camera_isp"})
+        self.assertTrue(self._patched_probe(v4l, "/dev/video0"))
+
+    def test_non_camera_module_rejected(self):
+        # The encode/decode nodes on the same board resolve to a module that
+        # does not name a camera.
+        root, v4l = self._sysfs({"video32": "venus_enc"})
+        self.assertFalse(self._patched_probe(v4l, "/dev/video32"))
+
+    def test_missing_module_link_rejected(self):
+        # The script's 2>/dev/null case: no module link means not a camera.
+        root, v4l = self._sysfs({"video0": None})
+        self.assertFalse(self._patched_probe(v4l, "/dev/video0"))
+
+    def test_absent_node_rejected(self):
+        # A node with no sysfs entry at all is not a camera either.
+        root, v4l = self._sysfs({})
+        self.assertFalse(self._patched_probe(v4l, "/dev/video9"))
+
+    def test_camera_range_limits_candidates(self):
+        # Only /dev/video0..31 are considered, so an encoder high up the range
+        # is never probed even if its driver would match.
+        probed = []
+
+        def probe(node):
+            probed.append(node)
+            return True
+
+        nodes = ["/dev/video0", "/dev/video31", "/dev/video32", "/dev/video33"]
+        with mock.patch.object(gen, "is_camera_devicenode", probe):
+            cameras = gen.find_camera_devicenodes(nodes)
+        # video31 is in range (the range is inclusive of 31); video32+ are not.
+        self.assertEqual(cameras, ["/dev/video0", "/dev/video31"])
+        self.assertEqual(probed, ["/dev/video0", "/dev/video31"])
+
+    def test_only_camera_nodes_selected(self):
+        # Of the in-range nodes, only those the driver probe accepts are kept.
+        nodes = ["/dev/video0", "/dev/video1", "/dev/video2"]
+        cameras = {"/dev/video0", "/dev/video2"}
+        with mock.patch.object(gen, "is_camera_devicenode", cameras.__contains__):
+            self.assertEqual(gen.find_camera_devicenodes(nodes),
+                             ["/dev/video0", "/dev/video2"])
+
+    def test_no_cameras_yields_empty(self):
+        with mock.patch.object(gen, "is_camera_devicenode", lambda node: False):
+            self.assertEqual(gen.find_camera_devicenodes(["/dev/video0"]), [])
+
+
+class NewClassTests(unittest.TestCase):
+    """End-to-end tests for the gpu/camera/audio/display class generation."""
+
+    def _spec(self, destdir, cdiclass):
+        path = Path(destdir) / "run" / "cdi" / ("qualcomm-%s.json" % cdiclass)
+        return json.loads(path.read_text())
+
+    def _written(self, destdir):
+        return sorted(p.name for p in (Path(destdir) / "run" / "cdi").glob("*.json"))
+
+    def _devices(self, spec):
+        return {d["name"]: d for d in spec["devices"]}
+
+    def test_gpu_carries_render_card_and_kgsl(self):
+        # The GPU class exposes the render node, the DRM card node and the
+        # KGSL node, each under its own device name, plus catch-alls.
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(run_generator(["-d", d, "-C", "gpu"]), 0)
+            devices = self._devices(self._spec(d, "gpu"))
+            self.assertIn("renderD128", devices)
+            self.assertIn("card0", devices)
+            self.assertIn("kgsl-3d0", devices)
+            # The historical renderD:all name is kept for compatibility, and
+            # gpu:all hands over the whole stack.
+            self.assertIn("renderD:all", devices)
+            self.assertIn("gpu:all", devices)
+            allpaths = sorted(n["path"] for n in
+                              devices["gpu:all"]["containerEdits"]["deviceNodes"])
+            self.assertEqual(allpaths, ["/dev/dri/card0", "/dev/dri/renderD128",
+                                        "/dev/kgsl-3d0"])
+
+    def test_gpu_without_kgsl_falls_back_to_card(self):
+        # On a board with no /dev/kgsl-3d0 the class is just render + card.
+        nodes = dict(FAKE_NODES, **{"/dev/kgsl-3d*": []})
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(run_generator(["-d", d, "-C", "gpu"], nodes), 0)
+            devices = self._devices(self._spec(d, "gpu"))
+            self.assertIn("renderD128", devices)
+            self.assertIn("card0", devices)
+            self.assertNotIn("kgsl-3d0", devices)
+            allpaths = sorted(n["path"] for n in
+                              devices["gpu:all"]["containerEdits"]["deviceNodes"])
+            self.assertEqual(allpaths, ["/dev/dri/card0", "/dev/dri/renderD128"])
+
+    def test_gpu_catchall_defined_once(self):
+        # Each device name must be unique within a spec; the per-glob calls
+        # must not each contribute their own ':all'.
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(run_generator(["-d", d, "-C", "gpu"]), 0)
+            names = [dev["name"] for dev in self._spec(d, "gpu")["devices"]]
+            self.assertEqual(len(names), len(set(names)), names)
+            self.assertEqual([n for n in names if n.endswith(":all")],
+                             ["renderD:all", "gpu:all"])
+
+    def test_gpu_spans_render_and_card_groups(self):
+        # A render node in 'render' next to a card node in 'video' is the
+        # normal case; the spec has to grant both groups.
+        with tempfile.TemporaryDirectory() as d:
+            rc = run_generator(["-d", d, "-C", "gpu"], node_gids={
+                "/dev/dri/renderD128": 110,
+                "/dev/dri/card0": 44,
+                "/dev/kgsl-3d0": 110,
+            })
+            self.assertEqual(rc, 0)
+            spec = self._spec(d, "gpu")
+            self.assertEqual(spec["containerEdits"]["additionalGids"], [44, 110])
+            bypath = {n["path"]: n["gid"] for dev in spec["devices"]
+                      for n in dev["containerEdits"]["deviceNodes"]}
+            self.assertEqual(bypath["/dev/dri/renderD128"], 110)
+            self.assertEqual(bypath["/dev/dri/card0"], 44)
+            self.assertEqual(bypath["/dev/kgsl-3d0"], 110)
+
+    def test_camera_requires_a_camera_driver(self):
+        # No camera driver on the board means no camera spec, even though
+        # /dev/video* nodes exist and the socket is present.
+        with tempfile.TemporaryDirectory() as d:
+            rc = run_generator(["-d", d], sockets=FAKE_SOCKETS.values())
+            self.assertEqual(rc, 0)
+            self.assertNotIn("qualcomm-camera.json", self._written(d))
+
+    def test_camera_nodes_and_socket(self):
+        # With a camera driver bound, the camera class carries that node and
+        # bind-mounts the camera server socket.
+        with tempfile.TemporaryDirectory() as d:
+            rc = run_generator(["-d", d], sockets=[FAKE_SOCKETS["camera"]],
+                               cameras=["/dev/video0"])
+            self.assertEqual(rc, 0)
+            spec = self._spec(d, "camera")
+            paths = [n["path"] for dev in spec["devices"]
+                     for n in dev["containerEdits"]["deviceNodes"]]
+            # Only the camera node, not the other V4L2 node on the board.
+            self.assertEqual(set(paths), {"/dev/video0"})
+            mounts = spec["containerEdits"]["mounts"]
+            self.assertEqual([m["hostPath"] for m in mounts],
+                             [FAKE_SOCKETS["camera"]])
+            self.assertEqual(mounts[0]["containerPath"], FAKE_SOCKETS["camera"])
+            self.assertIn("rw", mounts[0]["options"])
+
+    def test_camera_without_socket_still_exposes_nodes(self):
+        # The nodes are real even when the camera server is not running; the
+        # spec then carries no mount rather than a dangling one.
+        with tempfile.TemporaryDirectory() as d:
+            rc = run_generator(["-d", d], cameras=["/dev/video0"])
+            self.assertEqual(rc, 0)
+            spec = self._spec(d, "camera")
+            self.assertNotIn("mounts", spec["containerEdits"])
+
+    def test_v4l2_still_carries_every_node(self):
+        # The camera class narrows the selection; v4l2 keeps all of them.
+        with tempfile.TemporaryDirectory() as d:
+            rc = run_generator(["-d", d], cameras=["/dev/video0"])
+            self.assertEqual(rc, 0)
+            paths = {n["path"] for dev in self._spec(d, "v4l2")["devices"]
+                     for n in dev["containerEdits"]["deviceNodes"]}
+            self.assertEqual(paths, {"/dev/video0", "/dev/video1"})
+
+    def test_audio_and_display_are_socket_mounts(self):
+        # The socket-only classes pass through no device node; asking for the
+        # device is what bind-mounts the socket.
+        with tempfile.TemporaryDirectory() as d:
+            rc = run_generator(["-d", d], sockets=[FAKE_SOCKETS["audio"],
+                                                   FAKE_SOCKETS["display"]])
+            self.assertEqual(rc, 0)
+            for cdiclass, socket in (("audio", FAKE_SOCKETS["audio"]),
+                                     ("display", FAKE_SOCKETS["display"])):
+                spec = self._spec(d, cdiclass)
+                devices = self._devices(spec)
+                self.assertIn(cdiclass, devices)
+                self.assertIn(cdiclass + ":all", devices)
+                edits = devices[cdiclass]["containerEdits"]
+                self.assertNotIn("deviceNodes", edits)
+                self.assertEqual([m["hostPath"] for m in edits["mounts"]], [socket])
+                self.assertEqual(edits["mounts"][0]["containerPath"], socket)
+
+    def test_absent_sockets_skip_the_class(self):
+        # No socket means the server is not running, so no spec is written.
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(run_generator(["-d", d]), 0)
+            written = self._written(d)
+            self.assertNotIn("qualcomm-audio.json", written)
+            self.assertNotIn("qualcomm-display.json", written)
+
+    def test_socket_group_reaches_additional_gids(self):
+        # The socket is group-owned like a device node, and the container has
+        # to join that group to connect to it.
+        with tempfile.TemporaryDirectory() as d:
+            rc = run_generator(["-d", d], sockets=[FAKE_SOCKETS["audio"]],
+                               node_gids={FAKE_SOCKETS["audio"]: 29})
+            self.assertEqual(rc, 0)
+            self.assertEqual(
+                self._spec(d, "audio")["containerEdits"]["additionalGids"], [29])
+
+    def test_camera_gids_span_nodes_and_socket(self):
+        # The camera class reads a group from both its nodes and its socket.
+        with tempfile.TemporaryDirectory() as d:
+            rc = run_generator(["-d", d], sockets=[FAKE_SOCKETS["camera"]],
+                               cameras=["/dev/video0"],
+                               node_gids={"/dev/video0": 44,
+                                          FAKE_SOCKETS["camera"]: 1002})
+            self.assertEqual(rc, 0)
+            self.assertEqual(
+                self._spec(d, "camera")["containerEdits"]["additionalGids"],
+                [44, 1002])
+
+    def test_all_classes_written_on_a_full_board(self):
+        with tempfile.TemporaryDirectory() as d:
+            rc = run_generator(["-d", d], sockets=FAKE_SOCKETS.values(),
+                               cameras=["/dev/video0"])
+            self.assertEqual(rc, 0)
+            self.assertEqual(self._written(d), [
+                "qualcomm-audio.json",
+                "qualcomm-camera.json",
+                "qualcomm-display.json",
+                "qualcomm-dmaheap.json",
+                "qualcomm-fastrpc-adsp.json",
+                "qualcomm-fastrpc-cdsp.json",
+                "qualcomm-gpu.json",
+                "qualcomm-v4l2.json",
+            ])
+
+    def test_new_classes_are_selectable(self):
+        # --classes has to accept the new names, and scope the output to them.
+        with tempfile.TemporaryDirectory() as d:
+            rc = run_generator(["-d", d, "-C", "audio,display"],
+                               sockets=FAKE_SOCKETS.values())
+            self.assertEqual(rc, 0)
+            self.assertEqual(self._written(d), ["qualcomm-audio.json",
+                                                "qualcomm-display.json"])
+
+
 @unittest.skipIf(CDI_TOOL is None,
                  "cdi tool not found (set CDI_TOOL or put 'cdi' on PATH)")
 class ValidationTests(unittest.TestCase):
@@ -677,24 +996,70 @@ class ValidationTests(unittest.TestCase):
             self._write_spec(d, "fastrpc-cdsp", spec)
             self._assert_valid(d)
 
-    def test_fastrpc_spec_with_empty_mounts_validates(self):
-        # When no DSP firmware is found the generator still emits "mounts": [].
+    def test_fastrpc_spec_without_mounts_validates(self):
+        # When no DSP firmware is found the mounts key is omitted entirely.
         devices = gen.generate_devicenodes_cdi("fastrpc-adsp", ["/dev/fastrpc-adsp"])
         spec = gen.build_cdi_spec("fastrpc-adsp", devices, [], [])
+        self.assertNotIn("mounts", spec["containerEdits"])
         with tempfile.TemporaryDirectory() as d:
             self._write_spec(d, "fastrpc-adsp", spec)
             self._assert_valid(d)
+
+    def test_gpu_spec_with_card_and_kgsl_validates(self):
+        # The multi-glob GPU class: several device names in one spec, each node
+        # with its own gid, and two groups in additionalGids.
+        perms = lambda node: gen.node_permissions(
+            "gpu", None, None, 44 if "card" in node else 110)
+        devices = (gen.generate_devicenodes_cdi("renderD", ["/dev/dri/renderD128"], perms)
+                   + gen.generate_devicenodes_cdi("card", ["/dev/dri/card0"], perms,
+                                                  catchall=False)
+                   + gen.generate_devicenodes_cdi("kgsl-3d", ["/dev/kgsl-3d0"], perms,
+                                                  catchall=False)
+                   + gen.generate_devicenodes_cdi(
+                       "gpu", ["/dev/dri/renderD128", "/dev/dri/card0", "/dev/kgsl-3d0"],
+                       perms, pernode=False))
+        spec = gen.build_cdi_spec("gpu", devices, [], [],
+                                  gen.node_additional_gids("gpu", [44, 110]))
+        with tempfile.TemporaryDirectory() as d:
+            self._write_spec(d, "gpu", spec)
+            self._assert_valid(d)
+
+    def test_camera_spec_with_socket_validates(self):
+        devices = gen.generate_devicenodes_cdi("camera", ["/dev/video0", "/dev/video1"],
+                                               gen.node_permissions("camera"))
+        mounts = gen.generate_mounts_cdi(["/run/cam_server/le_camera_socket"])
+        spec = gen.build_cdi_spec("camera", devices, [], mounts,
+                                  gen.node_additional_gids("camera", [44, 1002]))
+        with tempfile.TemporaryDirectory() as d:
+            self._write_spec(d, "camera", spec)
+            self._assert_valid(d)
+
+    def test_socket_only_spec_validates(self):
+        # A device whose containerEdits carry only mounts and no deviceNodes is
+        # a shape the other classes never produce; confirm the schema accepts it.
+        for cdiclass, socket in (("audio", "/run/user/1000/pulse/native"),
+                                 ("display", "/run/user/1000/wayland-0")):
+            devices = gen.generate_sockets_cdi(cdiclass, [socket])
+            spec = gen.build_cdi_spec(cdiclass, devices, [], [],
+                                      gen.node_additional_gids(cdiclass, [1000]))
+            with tempfile.TemporaryDirectory() as d:
+                self._write_spec(d, cdiclass, spec)
+                self._assert_valid(d)
 
     def test_full_generator_run_validates(self):
         # Drive main() end to end with synthetic device discovery so every class
         # is produced, then validate the whole set of written files together.
         with tempfile.TemporaryDirectory() as d:
-            rc = run_generator(["-d", d])
+            rc = run_generator(["-d", d], sockets=FAKE_SOCKETS.values(),
+                               cameras=["/dev/video0"])
 
             self.assertEqual(rc, 0)
             cdi_dir = Path(d) / "run" / "cdi"
             written = sorted(p.name for p in cdi_dir.glob("*.json"))
             self.assertEqual(written, [
+                "qualcomm-audio.json",
+                "qualcomm-camera.json",
+                "qualcomm-display.json",
                 "qualcomm-dmaheap.json",
                 "qualcomm-fastrpc-adsp.json",
                 "qualcomm-fastrpc-cdsp.json",
