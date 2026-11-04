@@ -92,7 +92,7 @@ The tool probes the hardware and writes one CDI JSON file per device class under
 | `-d` | `--destdir` | `/` | Root directory for all output paths |
 | `-c` | `--cdifilename` | `qualcomm.json` | CDI filename base; the device class is inserted before the extension, e.g. `qualcomm.json` → `qualcomm-gpu.json` |
 | `-C` | `--classes` | all | Comma-separated list of CDI classes to generate. Available: `gpu`, `v4l2`, `camera`, `audio`, `display`, `dmaheap`, `fastrpc-cdsp`, `fastrpc-adsp`, `fastrpc-gdsp` |
-| `-g` | `--gid` | from host paths | `gid` to grant via `additionalGids`, overriding the group read from each host device node and socket |
+| `-g` | `--gid` | from host paths | `gid` to grant via `additionalGids`, replacing the group read from each host device node and socket |
 | `-n` | `--dry-run` | off | Probe devices but do not write any files |
 | `-v` | `--verbose` | off | Increase verbosity; use `-vv` for debug output |
 
@@ -633,16 +633,44 @@ would be worse than none for a client resolving firmware paths against it.
 
 ### Group access
 
-A generated `deviceNodes` entry is the path alone. The runtime resolves the rest
-from the host node it was given — type, major/minor and permissions — so the
-spec says nothing about ownership or modes and nothing on the host is changed.
+A generated `deviceNodes` entry is the path, the node's group and the mode to
+create it with:
+
+```json
+          {
+            "path": "/dev/dma_heap/system",
+            "gid": 992,
+            "fileMode": 432
+          }
+```
+
+The `gid` is the group that owns the node on this board, so the node the
+runtime creates inside the container belongs to the group the container is
+being put into. It is named per node, because one class can span several groups
+(see [Group access](#group-access)).
+
+`fileMode` is **432, which is octal 0660** — `rw-rw----`. JSON has no octal
+literal and the runtimes parse these files as strict JSON, so the mode is
+written as the decimal number a mode really is; `0660` in the file would not
+parse at all. The group bits are the point: the container user opens the node
+as a member of the group named next to it, so a mode without them would hand
+the container a node it still could not open. Nothing is granted to others.
+
+Both fields describe the node the runtime creates **inside the container**, not
+the host node they were resolved from. The host's nodes keep their own
+ownership and mode — the generator reads the group and changes nothing. The
+type and major/minor the runtime still fills in from the host node, and no
+`uid` is named: the group is what access is expressed through, and naming an
+owner would hand the node to a user the spec has no business choosing.
 
 What the spec does carry is `containerEdits.additionalGids`: the groups owning
 the host paths the class passes through, added to the container's supplementary
-groups. That is what makes a group-accessible resource reachable — a sound
-server socket bind-mounted with the host's permissions on it, or a device node
-the runtime bind-mounts rather than re-creates — without relaxing a mode on
-either side.
+groups and nothing else — no group is picked for the container, which is also
+what makes `--gid` a replacement rather than an addition. That is what makes a
+group-accessible resource reachable —
+a sound server socket bind-mounted with the host's permissions on it, or a
+device node the runtime bind-mounts rather than re-creates — without relaxing a
+mode on either side.
 
 Access is expressed entirely within the CDI spec: the generated files carry no
 `hooks`, so nothing of the generator's runs on the host at container start, and
@@ -672,24 +700,66 @@ The spec then grants every one of them:
 ```
 
 Granting only the most common group would leave exactly the paths that differ
-unreachable inside the container.
+unreachable inside the container. Granting anything *beyond* them is not done
+either — a spec lists what owns the paths it hands over and no `gid` chosen for
+the container:
 
-A path falls back to a built-in per-class default when it has no group of its
-own — it could not be read, or it is owned by group `root` (a `root:root` node
-has no group to join, and the runtime drops a `0` entry from `additionalGids`,
-so honouring it would grant an unprivileged container nothing):
+| Class | Groups on the host paths | `additionalGids` |
+|-------|--------------------------|------------------|
+| `gpu` | `renderD128` 993, `card0` 44 | `[ 44, 993 ]` |
+| `v4l2` | every `/dev/video*` 44 | `[ 44 ]` |
+| `dmaheap` | `/dev/dma_heap/system` 1000 | `[ 1000 ]` |
+| `audio` | socket 29 | `[ 29 ]` |
 
-| Class | Fallback `gid` | Rationale |
-|-------|----------------|-----------|
-| `gpu` | 1000 | render node handed to the container user's primary group |
-| `v4l2` | 44 | V4L2 nodes conventionally belong to the `video` group |
-| `camera` | 1000 | camera socket in the runtime dir, owned by that user's group |
-| `audio` | 1000 | audio socket in the user runtime dir, owned by that user's group |
-| `display` | 1000 | Wayland socket in the user runtime dir, likewise |
-| `dmaheap` | 1000 | DMA heap handed to the container user's primary group |
-| `fastrpc-cdsp` | 1000 | Hexagon DSP node handed to the container user's primary group |
-| `fastrpc-adsp` | 1000 | Hexagon DSP node handed to the container user's primary group |
-| `fastrpc-gdsp` | 1000 | Hexagon DSP node handed to the container user's primary group |
+A container whose user needs one of those groups as a supplementary group gets
+it from the spec; one that needs some other group is given it on the `docker
+run` command line, which is where a choice about the container's own identity
+belongs.
+
+##### The per-class fallback
+
+A path falls back to a per-class default when it has no group of its own — it
+could not be read, or it is owned by group `root` (a `root:root` node has no
+group to join, and the runtime drops a `0` entry from `additionalGids`, so
+honouring it would grant an unprivileged container nothing).
+
+That fallback is **looked up by group name** on the host being generated for,
+not compiled in as a number, because these groups are named alike across images
+and numbered differently. The same board under its two images:
+
+| Group | qualcomm-linux | Debian/Ubuntu |
+|-------|----------------|---------------|
+| `video` | 44 | 44 |
+| `audio` | 29 | 29 |
+| `render` | 993 | 993 |
+| `dmaheap` | **992** | **988** |
+| `fastrpc` | **999** | **126** |
+
+A number baked into the generator would be wrong on one image or the other,
+while `getgrnam()` is right on both and on an image that renumbers them again:
+
+| Class | Group looked up | Number if the group is missing |
+|-------|-----------------|--------------------------------|
+| `gpu` | `render` | 1000 |
+| `v4l2` | `video` | 44 |
+| `audio` | `audio` | 1000 |
+| `display` | `wayland` | 1000 |
+| `dmaheap` | `dmaheap` | 1000 |
+| `fastrpc-cdsp` | `fastrpc` | 1000 |
+| `fastrpc-adsp` | `fastrpc` | 1000 |
+| `fastrpc-gdsp` | `fastrpc` | 1000 |
+| `camera` | *(none)* | 1000 |
+
+The right-hand column is the last resort, for an image shipping the nodes
+without the group: there is no `gid` to look up, and the node's own group is
+what a working target would have supplied anyway. `camera` has no group of its
+own on either image — the camera server's socket carries whatever group the
+server runs as — so it is left to its number. A missing group is logged under
+`-vv`:
+
+```
+DEBUG: No 'wayland' group on this host for 'display'; using the built-in gid
+```
 
 For the socket-backed classes the group is read from the socket rather than a
 device node; everything else about the resolution is identical.
@@ -700,8 +770,10 @@ Override the resolution for all classes at once:
 # qualcomm-cdi-generator.py --gid 1000
 ```
 
-`--gid` replaces the group read from the host paths for every path and class, so
-the spec grants exactly that one group.
+`--gid` replaces the group read from the host paths for every path and class,
+so the spec grants exactly that one group. The
+default is not added on top: `--gid` is a replacement, and granting `1000` next
+to it would put the container in a group that was never asked for.
 
 ### Example session
 
@@ -943,7 +1015,7 @@ written, not what the generator looks at.
 ### CDI file structure
 
 The tool writes one JSON file per device class (see [Device
-classes](#device-classes)). Each file has a `kind` matching its class (e.g. `qualcomm.com/gpu`). A `deviceNodes` entry is the node's path alone, and the spec-level `containerEdits` sets `additionalGids` to every group owning one of the class's host paths (see [Group access](#group-access)). The `fastrpc` files additionally include bind-mounts for the individual Hexagon firmware files their own DSP's FastRPC client opens, presented under `/usr/share/hexagon-dsp/` and taken from the board directory the hexagon-dsp configuration names, along with that configuration directory and no other directory of the firmware tree (see [DSP firmware mounts](#dsp-firmware-mounts)), since those binaries are tightly coupled to the in-kernel firmware loader, and the devicetree model node holding the board name (see [Board name](#board-name)). The `fastrpc` files are also the only ones carrying an `env` entry, `MACHINE_NAME`, which is the only variable any generated file sets (see [The container environment](#the-container-environment)).
+classes](#device-classes)). Each file has a `kind` matching its class (e.g. `qualcomm.com/gpu`). A `deviceNodes` entry is the node's path, its owning group as `gid` and a `fileMode` of 432 (octal 0660), and the spec-level `containerEdits` sets `additionalGids` to every group owning one of the class's host paths (see [Group access](#group-access)). The `fastrpc` files additionally include bind-mounts for the individual Hexagon firmware files their own DSP's FastRPC client opens, presented under `/usr/share/hexagon-dsp/` and taken from the board directory the hexagon-dsp configuration names, along with that configuration directory and no other directory of the firmware tree (see [DSP firmware mounts](#dsp-firmware-mounts)), since those binaries are tightly coupled to the in-kernel firmware loader, and the devicetree model node holding the board name (see [Board name](#board-name)). The `fastrpc` files are also the only ones carrying an `env` entry, `MACHINE_NAME`, which is the only variable any generated file sets (see [The container environment](#the-container-environment)).
 
 The specs declare `cdiVersion` `0.7.0`, the first CDI version that defines
 `additionalGids`; see [Minimum runtime versions](#minimum-runtime-versions) for
@@ -992,7 +1064,7 @@ and card node in `video` (44):
       "name": "renderD128",
       "containerEdits": {
         "deviceNodes": [
-          { "path": "/dev/dri/renderD128" }
+          { "path": "/dev/dri/renderD128", "gid": 110, "fileMode": 432 }
         ]
       }
     },
@@ -1000,7 +1072,7 @@ and card node in `video` (44):
       "name": "render:all",
       "containerEdits": {
         "deviceNodes": [
-          { "path": "/dev/dri/renderD128" }
+          { "path": "/dev/dri/renderD128", "gid": 110, "fileMode": 432 }
         ]
       }
     },
@@ -1008,7 +1080,7 @@ and card node in `video` (44):
       "name": "card0",
       "containerEdits": {
         "deviceNodes": [
-          { "path": "/dev/dri/card0" }
+          { "path": "/dev/dri/card0", "gid": 44, "fileMode": 432 }
         ]
       }
     },
@@ -1016,8 +1088,8 @@ and card node in `video` (44):
       "name": "gpu:all",
       "containerEdits": {
         "deviceNodes": [
-          { "path": "/dev/dri/card0" },
-          { "path": "/dev/dri/renderD128" }
+          { "path": "/dev/dri/card0", "gid": 44, "fileMode": 432 },
+          { "path": "/dev/dri/renderD128", "gid": 110, "fileMode": 432 }
         ]
       }
     }
@@ -1027,6 +1099,10 @@ and card node in `video` (44):
   }
 }
 ```
+
+The `44` and `110` are the groups owning the card and render nodes on this
+board, named on each node entry as well as granted here, and they are all the
+spec grants.
 
 A `/dev/kgsl-3d0` node, where present, appears alongside `card0` under its own
 `kgsl-3d0` name and in `gpu:all`.
