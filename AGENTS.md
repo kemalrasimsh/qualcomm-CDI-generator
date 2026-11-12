@@ -4,7 +4,8 @@ This file guides automation agents to develop and validate changes the same
 way CI and the maintainers expect:
 
 - the project is a single Python script plus its packaging (setuptools and
-  Meson) — no special build toolchain is required to run it,
+  Meson) — no special build toolchain is required to run it, though the script
+  imports PyYAML (`python3-yaml`) at startup,
 - run the stand-alone unit test suite before opening/updating a PR, and
 - follow the project commit-message style with a `Signed-off-by` trailer.
 
@@ -32,10 +33,10 @@ Important:
 - All PRs are statically analysed with [Semgrep](https://github.com/semgrep/semgrep);
   resolve any flagged issues before merge.
 
-Before opening/updating a PR, run the stand-alone test suite. The structural
-tests need only the Python standard library; the validation tests
-additionally need the `cdi` tool on `PATH` (or via the `CDI_TOOL`
-environment variable) and are skipped when it is absent:
+Before opening/updating a PR, run the stand-alone test suite. It needs PyYAML,
+which the generator itself imports; the validation tests additionally need the
+`cdi` tool on `PATH` (or via the `CDI_TOOL` environment variable) and are
+skipped when it is absent:
 
 ```sh
 python3 -m unittest discover -s tests -v
