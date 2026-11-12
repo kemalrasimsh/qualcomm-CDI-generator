@@ -42,6 +42,12 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
+      - name: Install runtime dependencies
+        # The generator imports PyYAML at startup, so the tests that load it
+        # need it present. Unpinned, so the resolver picks a release the
+        # matrix Python supports.
+        run: python -m pip install PyYAML
+
       - name: Run structural tests
         run: >
           python -m unittest
@@ -93,6 +99,9 @@ jobs:
           sudo mkdir --parents /etc/cdi /var/run/cdi
           echo "CDI_TOOL=$RUNNER_TEMP/cdi" >> "$GITHUB_ENV"
 
+      - name: Install runtime dependencies
+        run: python -m pip install PyYAML
+
       - name: Run complete test suite
         run: python -m unittest discover -s tests -v
 
@@ -129,7 +138,9 @@ jobs:
           wheel_path="$(find dist -maxdepth 1 -name '*.whl' -print -quit)"
           test -n "$wheel_path"
           python -m venv "$RUNNER_TEMP/wheel-smoke"
-          "$RUNNER_TEMP/wheel-smoke/bin/python" -m pip install --no-deps "$wheel_path"
+          # With its dependencies, so the --help run below exercises what the
+          # wheel declares: the generator imports PyYAML at startup.
+          "$RUNNER_TEMP/wheel-smoke/bin/python" -m pip install "$wheel_path"
           test -x "$RUNNER_TEMP/wheel-smoke/sbin/qualcomm-cdi-generator.py"
           "$RUNNER_TEMP/wheel-smoke/bin/python" \
             "$RUNNER_TEMP/wheel-smoke/sbin/qualcomm-cdi-generator.py" --help
