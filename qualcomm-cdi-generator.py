@@ -348,6 +348,23 @@ DEVICE_MODEL_MOUNT_OPTIONS = ["rbind", "ro"]
 MACHINE_NAME_ENV = 'MACHINE_NAME'
 MACHINE_NAME_CLASSES = ('fastrpc-cdsp', 'fastrpc-adsp', 'fastrpc-gdsp')
 
+# Mode for the device node the runtime creates inside the container, carried on
+# every deviceNodes entry. 0660 is rw for the owner and rw for the group, which
+# with the gid named on the same entry is what lets the container user open the
+# node: it reaches the device as a member of the group owning it (see
+# generate_devicenodes_cdi() and node_additional_gids()), and a mode that left
+# the group bits off would hand it a node it still could not open.
+#
+# Nothing is granted to others, so the node is no more reachable inside the
+# container than the group it belongs to allows, and nothing on the host is
+# touched either way -- this is the mode of the node the runtime creates in the
+# container, not of the host node it was resolved from.
+#
+# JSON has no octal literal and the runtimes parse these files as strict JSON,
+# so 0o660 is serialised as the decimal 432 that a mode really is. '0660' in
+# the file would not parse at all.
+DEVICE_NODE_FILE_MODE = 0o660
+
 # Container-side directory to mount a socket into, keyed by the CLASS_SOCKETS
 # pattern that matched it on the host. A pattern with no entry here is mounted
 # at its own host path.
@@ -559,7 +576,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("-d", "--destdir", default="/", help="Destination root directory (default: %(default)s)")
     parser.add_argument("-c", "--cdifilename", default="qualcomm.json", help="CDI JSON filename base for the qualcomm.com specs; the device class is inserted before the extension, e.g. qualcomm.json -> qualcomm-gpu.json. A spec in another vendor namespace is named after that vendor instead, e.g. linux-audio.json (default: %(default)s)")
     parser.add_argument("-C", "--classes", default=None, help="Comma-separated list of CDI classes to generate (default: all). Available: %s" % ", ".join(KNOWN_CLASSES))
-    parser.add_argument("-g", "--gid", type=int, default=None, metavar="GID", help="gid to grant via additionalGids, overriding the group read from the host device nodes and sockets")
+    parser.add_argument("-g", "--gid", type=int, default=None, metavar="GID", help="gid to grant via additionalGids, replacing the group read from each host device node and socket")
     parser.add_argument("-n", "--dry-run", action="store_true", help="Parse and probe devices but do not write any files")
     parser.add_argument("-v", "--verbose", action="count", default=0, help="Increase verbosity (-v, -vv)")
     return parser.parse_args()
@@ -1266,7 +1283,8 @@ def generate_sockets_cdi(nickname: str, sockets: list[str]) -> list[dict]:
 
 def generate_devicenodes_cdi(nickname: str, filesglob: list[str],
                              pernode: bool = True,
-                             catchall: bool = True) -> list[dict]:
+                             catchall: bool = True,
+                             gidmap: dict[str, int] | None = None) -> list[dict]:
     """Build the CDI device entries for a list of device nodes.
 
     nickname:    base name for the emitted devices, suffixed with the node index
@@ -1274,10 +1292,24 @@ def generate_devicenodes_cdi(nickname: str, filesglob: list[str],
     filesglob:   the device nodes to expose
     pernode:     emit one device per node (renderD128, video0, ...)
     catchall:    emit the '<nickname>:all' device covering every node at once
+    gidmap:      the group to name for each node, from node_gid_map()
 
-    A deviceNodes entry is the path alone: the runtime fills the rest in from
-    the host node it resolves, and the groups the container needs are granted
-    once per spec through additionalGids (see node_additional_gids()).
+    A deviceNodes entry is the path, the node's group and the mode to create it
+    with. The type and major/minor the runtime still fills in from the host
+    node it resolves, and no uid is named, so the node keeps the identity the
+    host gave it in every respect the spec does not spell out.
+
+    The gid is the group that owns the node on this board, the same one the
+    class grants through additionalGids (see node_additional_gids()), and the
+    mode is DEVICE_NODE_FILE_MODE. Both describe the node the runtime creates
+    inside the container, not the host node: together they make it openable by
+    a container user that joined the group, on a runtime that creates the node
+    fresh rather than carrying the host's ownership and mode over with it.
+    Nothing on the host is read other than the group, and nothing on it is
+    changed.
+
+    A node missing from gidmap is emitted without a gid, there being no group
+    read for it to name, and keeps the mode.
 
     A class assembled from several globs calls this once per glob, with
     catchall=False on all but one so the ':all' device is not defined twice, and
@@ -1292,6 +1324,19 @@ def generate_devicenodes_cdi(nickname: str, filesglob: list[str],
         def is_sibling(node: str) -> bool:
             return node.endswith('-secure') and node[:-len('-secure')] in filesglob_set
 
+        def node_entry(node: str) -> dict:
+            # One deviceNodes entry: the path, the group resolved for that node
+            # where there is one, and the mode to create the node with. The gid
+            # is per node because one class can span several groups on a board,
+            # which is the same reason node_gid_map() resolves it per node; the
+            # mode is the same for every node (see DEVICE_NODE_FILE_MODE).
+            entry = {"path": node}
+            nodegid = (gidmap or {}).get(node)
+            if nodegid is not None:
+                entry["gid"] = nodegid
+            entry["fileMode"] = DEVICE_NODE_FILE_MODE
+            return entry
+
         def node_paths(node: str) -> list[dict]:
             # deviceNodes entries for one node: the node itself, plus its
             # -secure sibling when that sibling is present. The condition is the
@@ -1299,11 +1344,11 @@ def generate_devicenodes_cdi(nickname: str, filesglob: list[str],
             # top-level entry is placed here and none can be lost -- a
             # multi-DSP target's /dev/fastrpc-cdsp1-secure rides on
             # /dev/fastrpc-cdsp1 the way the unindexed pair does.
-            paths = [{"path": node}]
+            paths = [node_entry(node)]
             securepath = node + "-secure"
             if securepath in filesglob_set:
                 logging.debug("Adding -secure variant for %s", node)
-                paths.append({"path": securepath})
+                paths.append(node_entry(securepath))
             return paths
 
         def node_vendor(node: str) -> str | None:
@@ -1524,23 +1569,29 @@ def main() -> int:
     # One gid resolution for the whole class: the nodes often differ (a render
     # node in 'render' next to a card node in 'video'), and additionalGids has
     # to carry every one of those groups.
-    resolve_gids('gpu', gpunodes)
+    gpugids = resolve_gids('gpu', gpunodes)
     # The render nodes are named after the renderD* nodes themselves, but their
     # catch-all is 'render:all', named after the node class rather than the
     # renderD prefix one node happens to spell it with. The card and KGSL nodes
     # are added alongside under their own names, plus a single 'gpu:all' that
-    # hands over the whole GPU stack at once.
-    render_cdi = generate_devicenodes_cdi('renderD', rendernodes, catchall=False)
-    render_all_cdi = generate_devicenodes_cdi('render', rendernodes, pernode=False)
-    card_cdi = generate_devicenodes_cdi('card', cardnodes, catchall=False)
-    kgsl_cdi = generate_devicenodes_cdi('kgsl-3d', kgslnodes, catchall=False)
-    gpu_all_cdi = generate_devicenodes_cdi('gpu', gpunodes, pernode=False)
+    # hands over the whole GPU stack at once. Every call is handed the one gid
+    # map of the class, so a node names the same group wherever it appears.
+    render_cdi = generate_devicenodes_cdi('renderD', rendernodes,
+                                          catchall=False, gidmap=gpugids)
+    render_all_cdi = generate_devicenodes_cdi('render', rendernodes,
+                                              pernode=False, gidmap=gpugids)
+    card_cdi = generate_devicenodes_cdi('card', cardnodes, catchall=False,
+                                        gidmap=gpugids)
+    kgsl_cdi = generate_devicenodes_cdi('kgsl-3d', kgslnodes, catchall=False,
+                                        gidmap=gpugids)
+    gpu_all_cdi = generate_devicenodes_cdi('gpu', gpunodes, pernode=False,
+                                           gidmap=gpugids)
     gpu_cdi = render_cdi + render_all_cdi + card_cdi + kgsl_cdi + gpu_all_cdi
 
     # Find all videonodes and generate entries
     videonodes = find_devicenodes('/dev/video*')
-    resolve_gids('v4l2', videonodes)
-    video_cdi = generate_devicenodes_cdi('video', videonodes)
+    videogids = resolve_gids('v4l2', videonodes)
+    video_cdi = generate_devicenodes_cdi('video', videonodes, gidmap=videogids)
 
     # Socket-only classes. There is no device node to pass through: the
     # container reaches the host camera server, audio server and compositor
@@ -1560,21 +1611,25 @@ def main() -> int:
 
     # Check for DMA heap
     dmaheaps = find_devicenodes('/dev/dma_heap/*system')
-    resolve_gids('dmaheap', dmaheaps)
-    dmaheap_cdi = generate_devicenodes_cdi('dmaheap-system', dmaheaps)
+    dmaheapgids = resolve_gids('dmaheap', dmaheaps)
+    dmaheap_cdi = generate_devicenodes_cdi('dmaheap-system', dmaheaps,
+                                           gidmap=dmaheapgids)
 
     # Check for DSP nodes
     cdsps = find_devicenodes('/dev/fastrpc-cdsp*')
-    resolve_gids('fastrpc-cdsp', cdsps)
-    cdsps_cdi = generate_devicenodes_cdi('fastrpc-cdsp', cdsps)
+    cdspgids = resolve_gids('fastrpc-cdsp', cdsps)
+    cdsps_cdi = generate_devicenodes_cdi('fastrpc-cdsp', cdsps,
+                                         gidmap=cdspgids)
 
     adsps = find_devicenodes('/dev/fastrpc-adsp*')
-    resolve_gids('fastrpc-adsp', adsps)
-    adsps_cdi = generate_devicenodes_cdi('fastrpc-adsp', adsps)
+    adspgids = resolve_gids('fastrpc-adsp', adsps)
+    adsps_cdi = generate_devicenodes_cdi('fastrpc-adsp', adsps,
+                                         gidmap=adspgids)
 
     gdsps = find_devicenodes('/dev/fastrpc-gdsp*')
-    resolve_gids('fastrpc-gdsp', gdsps)
-    gdsps_cdi = generate_devicenodes_cdi('fastrpc-gdsp', gdsps)
+    gdspgids = resolve_gids('fastrpc-gdsp', gdsps)
+    gdsps_cdi = generate_devicenodes_cdi('fastrpc-gdsp', gdsps,
+                                         gidmap=gdspgids)
 
     # The board name, handed to the fastrpc containers twice over: as the
     # MACHINE_NAME their spec sets, and as the bind-mounted model node for

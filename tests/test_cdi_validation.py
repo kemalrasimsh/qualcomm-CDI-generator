@@ -243,8 +243,8 @@ def run_generator(extra_argv, fake_nodes=FAKE_NODES, node_gids=None,
     find_devicenodes is replaced with controlled node lists and the direct
     glob.glob() devicetree probe is served from the devicetree argument, so the
     run does not depend on the host hardware. node_gids maps node paths to the
-    group to report for them; nodes left out of it stat as absent, so the
-    generator falls back to its per-class default group.
+    group to report for them; nodes left out of it stat as absent, so no group
+    is named for them at all.
 
     sockets lists the host sockets that exist for this run (paths, as in
     FAKE_SOCKETS.values()); any socket not listed is reported absent, which is
@@ -584,6 +584,12 @@ class StructuralTests(unittest.TestCase):
         self.assertEqual(gen.node_additional_gids(0), [])
         self.assertEqual(gen.node_additional_gids([0]), [])
 
+    def test_nothing_is_granted_beyond_the_groups_read(self):
+        # A spec names the groups owning the paths the class hands over and no
+        # group picked for the container. It is also what makes --gid a
+        # replacement rather than an addition.
+        self.assertEqual(gen.node_additional_gids([4242]), [4242])
+
     def test_no_group_is_invented_for_any_class(self):
         # There is no per-class fallback of any kind: what a spec grants is
         # what was read off the host paths, so a class whose paths named no
@@ -817,24 +823,62 @@ class StructuralTests(unittest.TestCase):
                        for n in d["containerEdits"]["deviceNodes"]}
             self.assertEqual(emitted, set(nodes), nodes)
 
-    def test_device_nodes_carry_only_the_path(self):
-        # Access is granted once per spec through additionalGids, so a node
-        # entry names the path and nothing else: the runtime fills in the type,
-        # major/minor and permissions from the host node it resolves.
-        devices = gen.generate_devicenodes_cdi("video", ["/dev/video0", "/dev/video1"])
+    def test_device_nodes_carry_the_path_gid_and_mode(self):
+        # A node entry names the path, the group that owns the node and the
+        # mode to create it with, and nothing else: the runtime fills in the
+        # type and major/minor from the host node it resolves.
+        devices = gen.generate_devicenodes_cdi(
+            "video", ["/dev/video0", "/dev/video1"],
+            gidmap={"/dev/video0": 44, "/dev/video1": 1002})
         emitted = [n for d in devices for n in d["containerEdits"]["deviceNodes"]]
         self.assertTrue(emitted)
         for node in emitted:
-            self.assertEqual(list(node), ["path"])
+            self.assertEqual(list(node), ["path", "gid", "fileMode"])
+            self.assertEqual(node["fileMode"], gen.DEVICE_NODE_FILE_MODE)
+        # The gid is per node, so a class spanning two groups names both.
+        self.assertEqual({(n["path"], n["gid"]) for n in emitted},
+                         {("/dev/video0", 44), ("/dev/video1", 1002)})
 
-    def test_secure_sibling_carries_only_the_path(self):
-        # The -secure node folded into its parent entry is emitted the same way.
+    def test_device_node_file_mode_is_group_readable_and_writable(self):
+        # The mode has to leave the group bits on: the container user opens the
+        # node as a member of the group named next to it, so a mode without
+        # them would hand it a node it still could not open. Nothing is granted
+        # to others.
+        self.assertEqual(gen.DEVICE_NODE_FILE_MODE, 0o660)
+
+    def test_device_node_file_mode_serialises_as_a_json_number(self):
+        # JSON has no octal literal and the runtimes parse these files as
+        # strict JSON, so the mode goes out as the decimal a mode really is.
+        # '0660' in the file would not parse at all.
+        devices = gen.generate_devicenodes_cdi("video", ["/dev/video0"])
+        written = json.loads(json.dumps(devices))
+        node = written[0]["containerEdits"]["deviceNodes"][0]
+        self.assertEqual(node["fileMode"], 432)
+        self.assertNotIn("0660", json.dumps(devices))
+
+    def test_device_nodes_without_a_resolved_gid_carry_no_gid(self):
+        # No group was read for the node, so there is none to name and the
+        # entry leaves it out rather than inventing one. The mode is not
+        # conditional on it.
+        devices = gen.generate_devicenodes_cdi("video", ["/dev/video0"])
+        emitted = [n for d in devices for n in d["containerEdits"]["deviceNodes"]]
+        self.assertTrue(emitted)
+        for node in emitted:
+            self.assertEqual(list(node), ["path", "fileMode"])
+
+    def test_secure_sibling_carries_its_own_gid(self):
+        # The -secure node folded into its parent entry is emitted the same
+        # way, with the group resolved for the sibling rather than the parent's.
         devices = gen.generate_devicenodes_cdi(
-            "fastrpc-cdsp", ["/dev/fastrpc-cdsp", "/dev/fastrpc-cdsp-secure"])
+            "fastrpc-cdsp", ["/dev/fastrpc-cdsp", "/dev/fastrpc-cdsp-secure"],
+            gidmap={"/dev/fastrpc-cdsp": 999,
+                    "/dev/fastrpc-cdsp-secure": 1002})
         named = {d["name"]: d for d in devices}
         secure = [n for n in named["fastrpc-cdsp"]["containerEdits"]["deviceNodes"]
                   if n["path"].endswith("-secure")]
-        self.assertEqual(secure, [{"path": "/dev/fastrpc-cdsp-secure"}])
+        self.assertEqual(secure, [{"path": "/dev/fastrpc-cdsp-secure",
+                                   "gid": 1002,
+                                   "fileMode": gen.DEVICE_NODE_FILE_MODE}])
 
     def test_node_entries_are_not_aliased(self):
         # Each emitted node needs its own dict; a shared one would let a later
@@ -847,16 +891,50 @@ class StructuralTests(unittest.TestCase):
         spec = json.loads((Path(destdir) / "run" / "cdi" / filename).read_text())
         return [n for d in spec["devices"] for n in d["containerEdits"]["deviceNodes"]]
 
-    def test_generated_files_carry_no_node_permissions(self):
-        # End to end: the written specs describe access through additionalGids
-        # only, so no deviceNodes entry may carry ownership or a mode.
+    def test_generated_files_carry_no_node_uid(self):
+        # End to end: a node entry carries its path, its group and the mode to
+        # create it with, and nothing else. No uid in particular -- the group
+        # is what access is expressed through, and naming an owner would hand
+        # the node to a user the spec has no business choosing.
         with tempfile.TemporaryDirectory() as d:
-            self.assertEqual(run_generator(["-d", d]), 0)
+            self.assertEqual(
+                run_generator(["-d", d], node_gids=ALL_NODES_STAT), 0)
             for filename in NODE_SPEC_FILES:
                 nodes = self._written_nodes(d, filename)
                 self.assertTrue(nodes, "%s has no device nodes" % filename)
                 for node in nodes:
-                    self.assertEqual(list(node), ["path"], filename)
+                    self.assertEqual(list(node), ["path", "gid", "fileMode"],
+                                     filename)
+
+    def test_generated_files_carry_the_node_file_mode(self):
+        # The mode reaches the written files, as the number JSON can carry.
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(run_generator(["-d", d]), 0)
+            for filename in (SPEC_FILES["v4l2"], SPEC_FILES["gpu"],
+                             SPEC_FILES["dmaheap"]):
+                for node in self._written_nodes(d, filename):
+                    self.assertEqual(node["fileMode"], 0o660,
+                                     "%s %s" % (filename, node["path"]))
+
+    def test_generated_files_carry_the_host_node_gid(self):
+        # The gid on each node entry is the group that owns it on this board,
+        # the same one the class grants through additionalGids.
+        with tempfile.TemporaryDirectory() as d:
+            gids = {"/dev/video0": 44, "/dev/video1": 1002}
+            self.assertEqual(run_generator(["-d", d], node_gids=gids), 0)
+            emitted = {n["path"]: n["gid"]
+                       for n in self._written_nodes(d, SPEC_FILES["v4l2"])
+                       if n["path"] in gids}
+            self.assertEqual(emitted, gids)
+
+    def test_gid_override_reaches_the_node_entries(self):
+        # --gid replaces the group of every node, so the entries name it too
+        # rather than keeping the one read off the host.
+        with tempfile.TemporaryDirectory() as d:
+            rc = run_generator(["-d", d, "-g", "1001"], node_gids=ALL_NODES_STAT)
+            self.assertEqual(rc, 0)
+            for node in self._written_nodes(d, SPEC_FILES["v4l2"]):
+                self.assertEqual(node["gid"], 1001, node["path"])
 
     def test_host_node_group_reaches_generated_files(self):
         # A run against nodes owned by a group of the board's own must emit
@@ -891,7 +969,7 @@ class StructuralTests(unittest.TestCase):
             # so its spec grants none.
             self.assertNotIn(
                 "additionalGids",
-                self._spec(d, "qualcomm-dmaheap.json")["containerEdits"])
+                self._spec(d, SPEC_FILES["dmaheap"])["containerEdits"])
 
     def test_mixed_group_class_grants_every_group(self):
         # A board that splits one class across groups (seen in the wild as
@@ -905,7 +983,8 @@ class StructuralTests(unittest.TestCase):
             })
             self.assertEqual(rc, 0)
             spec = self._spec(d, SPEC_FILES["v4l2"])
-            self.assertEqual(spec["containerEdits"]["additionalGids"], [44, 1002])
+            self.assertEqual(spec["containerEdits"]["additionalGids"],
+                             [44, 1002])
 
     def test_mixed_group_gid_override_collapses_to_one(self):
         # --gid replaces every probed group, so the spec goes back to granting
@@ -1060,12 +1139,16 @@ class StructuralTests(unittest.TestCase):
 
     def test_a_host_whose_nodes_name_no_group(self):
         # Nodes that could not be stat()ed name no group, and nothing stands
-        # in for one: the spec grants none rather than a number picked for the
-        # container.
+        # in for one: the node entries carry no gid and the spec grants none
+        # rather than a number picked for the container.
         with tempfile.TemporaryDirectory() as d:
             self.assertEqual(run_generator(["-d", d]), 0)
             spec = self._spec(d, SPEC_FILES["v4l2"])
             self.assertNotIn("additionalGids", spec["containerEdits"])
+            nodes = self._written_nodes(d, SPEC_FILES["v4l2"])
+            self.assertTrue(nodes)
+            for node in nodes:
+                self.assertEqual(list(node), ["path", "fileMode"])
 
     def test_gid_override_reaches_additional_gids(self):
         with tempfile.TemporaryDirectory() as d:
@@ -1076,7 +1159,8 @@ class StructuralTests(unittest.TestCase):
                     [1001], filename)
 
     def test_gid_override_beats_host_node_group(self):
-        # --gid has to win over a group that was really read off a node.
+        # --gid has to win over a group that was really read off a node, not
+        # just over the per-class fallback.
         with tempfile.TemporaryDirectory() as d:
             rc = run_generator(["-d", d, "-g", "1001"], node_gids=ALL_NODES_STAT)
             self.assertEqual(rc, 0)
@@ -2525,7 +2609,8 @@ class NewClassTests(unittest.TestCase):
             })
             self.assertEqual(rc, 0)
             spec = self._spec(d, "gpu")
-            self.assertEqual(spec["containerEdits"]["additionalGids"], [44, 110])
+            self.assertEqual(spec["containerEdits"]["additionalGids"],
+                             [44, 110])
             paths = {n["path"] for dev in spec["devices"]
                      for n in dev["containerEdits"]["deviceNodes"]}
             self.assertEqual(paths, {"/dev/dri/renderD128", "/dev/dri/card0",
